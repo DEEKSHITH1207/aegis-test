@@ -21,7 +21,7 @@ infrastructure: the health endpoint and the DRF exception handler that turns a
 service-layer validation error into a 400 rather than a 500.
 
 `apps.testing` owns the product domain — specifications, endpoints, runs, cases,
-evidence and findings. It is a single app rather than one app per model because
+evidence and findings — plus `openapi.py`, which reads specification documents. It is a single app rather than one app per model because
 these seven models form one tightly connected graph with one lifecycle: they are
 always queried together and a specification's deletion removes all of them.
 Splitting them would create circular dependencies between apps and buy nothing.
@@ -101,3 +101,54 @@ the shape of a payload, not what the system should do about it. The split is not
 ceremony — the Celery tasks added in a later phase need to run the same
 operations with no view layer in front of them, and services are the only form
 both callers can share.
+
+## Reading specifications
+
+`apps/testing/openapi.py` turns a decoded OpenAPI 3.x or Swagger 2.0 document
+into plain dataclasses. It is deliberately pure: no database, and no network.
+
+The no-network rule is a security property, not an optimisation. A `$ref` may
+name an external URL, and resolving one would let anyone who can register a
+specification make the server issue an outbound request of their choosing.
+External references are therefore left unresolved and reported as a warning.
+
+Local references *are* inlined, so a stored schema is self-contained and a later
+phase can generate test data from it without carrying the whole document around.
+Resolution is depth-limited and tracks the references already being followed, so
+a self-referential schema (`User.manager` → `User`) terminates by leaving the
+inner `$ref` in place rather than expanding forever.
+
+Resolution happens once, at the outermost object. The helpers that then read a
+schema out of a `content` map do not resolve again: each extra pass would walk
+one further step into a recursive schema, so re-resolving would quietly undo the
+cycle guard.
+
+Parsing is lenient where a document is merely untidy and strict where it claims
+to describe an operation. An unusable operation — a `trace`, a path that does not
+start with `/`, a path longer than the column that stores it — is skipped and
+reported with a reason. Only a document that cannot describe an API at all (no
+version key, no `paths`, not an object) is rejected, and then every problem is
+reported at once rather than only the first.
+
+## Importing
+
+`services.import_endpoints` applies a parsed document to the database in one
+transaction, so a specification never ends up describing a mixture of two
+versions of an API.
+
+Endpoints are matched on `(path, method)` — the pair the database already treats
+as an endpoint's identity — which makes re-import idempotent and lets an edited
+operation be updated in place, keeping the test cases and findings attached to
+it. An import only ever writes the fields the parser produces, so data added by
+any other means is left alone.
+
+Endpoints that disappear from a document are reported as `stale` rather than
+deleted. Deleting one would cascade to its test cases and every request,
+response and finding recorded against them: an edit to a document would silently
+destroy test history. Deciding what to do about a stale endpoint is a product
+decision, and it needs an explicit action rather than a side effect of import.
+
+Only `source_type` is copied back onto the specification from the document. Name
+and version are not: they identify the specification and are covered by a unique
+constraint, so overwriting them from a file could collide with another row or
+rename something a user is already working with.

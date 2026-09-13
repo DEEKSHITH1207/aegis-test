@@ -12,10 +12,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from dataclasses import dataclass, field
+
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 
 from apps.core.exceptions import DomainError
+from apps.testing import openapi
 from apps.testing.models import (
     Endpoint,
     Finding,
@@ -52,6 +56,137 @@ def create_endpoint(*, specification: Specification, **fields: Any) -> Endpoint:
     endpoint.full_clean()
     endpoint.save()
     return endpoint
+
+
+# --- Importing endpoints from a specification ---------------------------------
+
+
+@dataclass
+class ImportResult:
+    """What one import did to a specification's endpoints.
+
+    ``stale`` lists endpoints that exist in the database but are no longer in
+    the document. They are reported rather than deleted: removing one would
+    cascade to its test cases and every request, response and finding recorded
+    against them, destroying history to reflect an edit to a document.
+    """
+
+    created: list[Endpoint] = field(default_factory=list)
+    updated: list[Endpoint] = field(default_factory=list)
+    unchanged: list[Endpoint] = field(default_factory=list)
+    stale: list[Endpoint] = field(default_factory=list)
+    skipped: list[openapi.SkippedOperation] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    title: str = ""
+    api_version: str = ""
+    source_type: str = ""
+
+    @property
+    def imported_count(self) -> int:
+        return len(self.created) + len(self.updated) + len(self.unchanged)
+
+
+# The Endpoint fields an import owns. Anything outside this list is left alone,
+# so a re-import never clobbers data the parser does not produce.
+_IMPORTED_ENDPOINT_FIELDS = (
+    "operation_id",
+    "summary",
+    "description",
+    "parameters",
+    "request_schema",
+    "response_schema",
+)
+
+
+@transaction.atomic
+def import_endpoints(*, specification: Specification) -> ImportResult:
+    """Parse a specification's stored document into Endpoint rows.
+
+    The whole import is one transaction: a document either lands completely or
+    not at all, so a failure halfway through cannot leave a specification
+    describing a mixture of two versions of an API.
+
+    Re-importing is safe and idempotent. Endpoints are matched on path and
+    method — the pair the database already treats as an endpoint's identity —
+    so an edited operation is updated in place and keeps its test history.
+    """
+    try:
+        parsed = openapi.parse(specification.raw_specification)
+    except openapi.SpecificationParseError as exc:
+        # The document is the user's input, so report it against that field.
+        raise ValidationError({"raw_specification": exc.errors}) from exc
+
+    result = ImportResult(
+        skipped=list(parsed.skipped),
+        warnings=list(parsed.warnings),
+        title=parsed.title,
+        api_version=parsed.api_version,
+        source_type=parsed.source_type,
+    )
+
+    existing = {
+        (endpoint.path, endpoint.method): endpoint
+        for endpoint in specification.endpoints.all()
+    }
+
+    for operation in parsed.operations:
+        endpoint = existing.pop((operation.path, operation.method), None)
+        if endpoint is None:
+            result.created.append(_create_imported_endpoint(specification, operation))
+        elif _apply_operation(endpoint, operation):
+            result.updated.append(endpoint)
+        else:
+            result.unchanged.append(endpoint)
+
+    # Whatever is left was in the database but not in the document.
+    result.stale = sorted(existing.values(), key=lambda e: (e.path, e.method))
+
+    _sync_source_type(specification, parsed.source_type)
+    return result
+
+
+def _create_imported_endpoint(
+    specification: Specification, operation: openapi.ParsedOperation
+) -> Endpoint:
+    endpoint = Endpoint(
+        specification=specification,
+        path=operation.path,
+        method=operation.method,
+        **{name: getattr(operation, name) for name in _IMPORTED_ENDPOINT_FIELDS},
+    )
+    endpoint.full_clean()
+    endpoint.save()
+    return endpoint
+
+
+def _apply_operation(endpoint: Endpoint, operation: openapi.ParsedOperation) -> bool:
+    """Update an endpoint in place. Returns whether anything actually changed."""
+    changed = [
+        name
+        for name in _IMPORTED_ENDPOINT_FIELDS
+        if getattr(endpoint, name) != getattr(operation, name)
+    ]
+    if not changed:
+        return False
+
+    for name in changed:
+        setattr(endpoint, name, getattr(operation, name))
+    endpoint.full_clean()
+    endpoint.save(update_fields=[*changed, "updated_at"])
+    return True
+
+
+def _sync_source_type(specification: Specification, source_type: str) -> None:
+    """Let the document correct the dialect recorded against the specification.
+
+    Only source_type is taken from the document. Name and version are not: they
+    identify the specification and are covered by a unique constraint, so
+    overwriting them from a file could collide with another row or silently
+    rename something a user is already working with.
+    """
+    if source_type and specification.source_type != source_type:
+        specification.source_type = source_type
+        specification.save(update_fields=["source_type", "updated_at"])
 
 
 # --- Test runs ----------------------------------------------------------------

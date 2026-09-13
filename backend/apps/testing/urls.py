@@ -24,6 +24,11 @@ urlpatterns = [
         views.SpecificationEndpointListView.as_view(),
         name="specification-endpoint-list",
     ),
+    path(
+        "specifications/<int:specification_id>/import/",
+        views.SpecificationImportView.as_view(),
+        name="specification-import",
+    ),
     path("test-runs/", views.TestRunListCreateView.as_view(), name="test-run-list"),
     path("test-runs/<int:pk>/", views.TestRunDetailView.as_view(), name="test-run-detail"),
     path(

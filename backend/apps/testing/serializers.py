@@ -137,3 +137,48 @@ class FindingSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class SkippedOperationSerializer(serializers.Serializer):
+    """An operation the parser found but could not import, and why."""
+
+    path = serializers.CharField()
+    method = serializers.CharField(allow_blank=True)
+    reason = serializers.CharField()
+
+
+class StaleEndpointSerializer(serializers.Serializer):
+    """An endpoint the database still holds that the document no longer lists."""
+
+    id = serializers.IntegerField()
+    path = serializers.CharField()
+    method = serializers.CharField()
+
+
+class ImportResultSerializer(serializers.Serializer):
+    """The outcome of importing a specification document.
+
+    Endpoints that were created, updated or left untouched are reported as
+    counts; things needing a human decision — skipped operations, unresolved
+    references, endpoints no longer in the document — are listed in full.
+    """
+
+    source_type = serializers.CharField()
+    title = serializers.CharField()
+    api_version = serializers.CharField()
+    created = serializers.SerializerMethodField()
+    updated = serializers.SerializerMethodField()
+    unchanged = serializers.SerializerMethodField()
+    imported_count = serializers.IntegerField()
+    stale = StaleEndpointSerializer(many=True)
+    skipped = SkippedOperationSerializer(many=True)
+    warnings = serializers.ListField(child=serializers.CharField())
+
+    def get_created(self, result) -> int:
+        return len(result.created)
+
+    def get_updated(self, result) -> int:
+        return len(result.updated)
+
+    def get_unchanged(self, result) -> int:
+        return len(result.unchanged)

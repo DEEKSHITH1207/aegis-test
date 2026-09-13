@@ -8,13 +8,17 @@ the same operations remain callable from a Celery task in a later phase.
 from __future__ import annotations
 
 from django.shortcuts import get_object_or_404
-from rest_framework import generics
+from rest_framework import generics, status
+from rest_framework.request import Request
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.testing import services
 from apps.testing.models import Specification, TestRun
 from apps.testing.serializers import (
     EndpointSerializer,
     FindingSerializer,
+    ImportResultSerializer,
     SpecificationSerializer,
     TestCaseSerializer,
     TestRunSerializer,
@@ -48,6 +52,20 @@ class SpecificationEndpointListView(generics.ListAPIView):
     def get_queryset(self):
         specification = get_object_or_404(Specification, pk=self.kwargs["specification_id"])
         return services.list_endpoints(specification=specification)
+
+
+class SpecificationImportView(APIView):
+    """Parse a specification's stored document into endpoints.
+
+    Returns 200 rather than 201: the call is idempotent and may legitimately
+    create nothing, so it reports what an import did rather than claiming a new
+    resource every time.
+    """
+
+    def post(self, request: Request, specification_id: int) -> Response:
+        specification = get_object_or_404(Specification, pk=specification_id)
+        result = services.import_endpoints(specification=specification)
+        return Response(ImportResultSerializer(result).data, status=status.HTTP_200_OK)
 
 
 class TestRunListCreateView(generics.ListCreateAPIView):
