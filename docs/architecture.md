@@ -17,8 +17,14 @@ settings, the root URLconf, the Celery app, and the WSGI/ASGI entrypoints. It
 holds no business logic.
 
 `backend/apps/` holds Django *applications*. `apps.core` owns cross-cutting
-infrastructure endpoints. Phase 2 adds feature apps (specifications, test runs,
-findings) as siblings, each with its own models, serializers, services and URLs.
+infrastructure: the health endpoint and the DRF exception handler that turns a
+service-layer validation error into a 400 rather than a 500.
+
+`apps.testing` owns the product domain — specifications, endpoints, runs, cases,
+evidence and findings. It is a single app rather than one app per model because
+these seven models form one tightly connected graph with one lifecycle: they are
+always queried together and a specification's deletion removes all of them.
+Splitting them would create circular dependencies between apps and buy nothing.
 
 Business logic belongs in a `services.py` module inside the owning app. Views
 stay thin: parse input, call a service, serialize the result. This keeps the
@@ -55,5 +61,43 @@ alongside `v1` rather than breaking existing clients.
 
 `config/celery.py` defines the Celery app and reads its configuration from
 Django settings via the `CELERY_` namespace, so there is a single place to
-configure the queue. There are no tasks and no worker service yet — those arrive
-with the test executor in Phase 2, when there is real work to run.
+configure the queue. There are still no tasks and no worker service — those
+arrive with the test executor, when there is real work to run. Phase 2 added the
+data model those tasks will write to, not the tasks themselves.
+
+## Domain model
+
+```
+Specification ──< Endpoint
+      │               │
+      └──< TestRun ──< TestCase ──< RequestRecord ──1:1── ResponseRecord
+                          │                                     │
+                          └──────────< Finding >────────────────┘
+```
+
+`Specification` is the root of every tree. Deleting one cascades to its
+endpoints, its runs, and everything those runs produced, so there is exactly one
+place to remove an API and everything ever recorded about it.
+
+`RequestRecord` and `ResponseRecord` are immutable evidence: written once when a
+request is executed, never edited, so they carry `created_at` but no
+`updated_at`. A request has at most one response (`OneToOneField`), while a test
+case may have several requests — a retry or a setup call.
+
+`Finding.response_record` is nullable and uses `SET_NULL`. A finding such as
+"the endpoint never responded" has no response to cite, and pruning old evidence
+must not erase the conclusion drawn from it.
+
+One invariant cannot be expressed as a database constraint: a `TestCase`'s
+endpoint must belong to its run's specification. Enforcing it in SQL would mean
+denormalising the specification onto the row, so it lives in `TestCase.clean()`
+and in the service that creates cases.
+
+## Where logic lives
+
+`apps/testing/services.py` holds the business operations. Views resolve inputs,
+call a service and serialise the result; they hold no rules. Serializers check
+the shape of a payload, not what the system should do about it. The split is not
+ceremony — the Celery tasks added in a later phase need to run the same
+operations with no view layer in front of them, and services are the only form
+both callers can share.

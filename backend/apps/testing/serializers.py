@@ -1,0 +1,139 @@
+"""Serializers for the testing domain.
+
+These handle shape and field-level validation only. Rules that involve more
+than one object, or that decide what the system does, belong in services.py.
+Relations are exposed as primary keys: the API stays predictable and a list
+response never fans out into queries the caller did not ask for.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from rest_framework import serializers
+
+from apps.testing.models import (
+    Endpoint,
+    Finding,
+    Specification,
+    TestCase,
+    TestRun,
+)
+
+
+class SpecificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Specification
+        fields = [
+            "id",
+            "name",
+            "description",
+            "source_type",
+            "raw_specification",
+            "version",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_name(self, value: str) -> str:
+        # A name of spaces passes CharField's blank check but is not a name.
+        name = value.strip()
+        if not name:
+            raise serializers.ValidationError("This field may not be blank.")
+        return name
+
+
+class EndpointSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Endpoint
+        fields = [
+            "id",
+            "specification",
+            "path",
+            "method",
+            "operation_id",
+            "summary",
+            "description",
+            "parameters",
+            "request_schema",
+            "response_schema",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "specification", "created_at", "updated_at"]
+
+
+class TestRunSerializer(serializers.ModelSerializer):
+    # Omitting the name is normal; the service derives one from the
+    # specification. Status and the timestamps are driven by the run's
+    # lifecycle, never set by the client.
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+
+    class Meta:
+        model = TestRun
+        fields = [
+            "id",
+            "specification",
+            "name",
+            "status",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class TestCaseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TestCase
+        fields = [
+            "id",
+            "test_run",
+            "endpoint",
+            "name",
+            "description",
+            "test_type",
+            "input_data",
+            "expected_status_code",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "status", "created_at", "updated_at"]
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        test_run = attrs.get("test_run")
+        endpoint = attrs.get("endpoint")
+        if test_run and endpoint and test_run.specification_id != endpoint.specification_id:
+            raise serializers.ValidationError(
+                {"endpoint": "Endpoint must belong to the same specification as the test run."}
+            )
+        return attrs
+
+
+class FindingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Finding
+        fields = [
+            "id",
+            "test_case",
+            "response_record",
+            "title",
+            "description",
+            "severity",
+            "category",
+            "evidence",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]

@@ -7,10 +7,11 @@ cases against a target API, analyses the responses, and reports bugs, validation
 gaps, inconsistencies and security issues. An LLM is used as a reasoning layer
 over the collected evidence — never as the sole source of truth.
 
-**Status: Phase 1 — backend foundation.** The service boots, is configured from
-the environment, talks to PostgreSQL and Redis, has Celery wired up, and exposes
-a health check. Spec parsing, test generation, execution and LLM analysis come in
-later phases.
+**Status: Phase 2 — data model and REST foundation.** On top of the Phase 1
+foundation, the domain is now modelled and persisted: specifications, endpoints,
+test runs, test cases, request/response evidence and findings, with a read/write
+REST API under `/api/v1/`. Spec parsing, test generation, execution and LLM
+analysis come in later phases — nothing calls a target API yet.
 
 ## Architecture
 
@@ -32,7 +33,8 @@ reasoning behind the layout.
 aegis-test/
 ├── backend/
 │   ├── config/        Django project: settings, URLs, Celery, WSGI/ASGI
-│   ├── apps/core/     cross-cutting endpoints (health check)
+│   ├── apps/core/     cross-cutting concerns (health check, error translation)
+│   ├── apps/testing/  the domain: models, services, serializers, views, URLs
 │   ├── manage.py
 │   ├── pytest.ini     pytest-django configuration
 │   └── Dockerfile
@@ -94,9 +96,12 @@ python manage.py runserver
 The Postgres role and database in `.env` must exist:
 
 ```bash
-sudo -u postgres createuser --pwprompt aegis
+sudo -u postgres createuser --createdb --pwprompt aegis
 sudo -u postgres createdb --owner aegis aegis
 ```
+
+`--createdb` is required for the test suite, not for the application: pytest
+creates and drops a separate `test_aegis` database on every run.
 
 ## Tests
 
@@ -112,13 +117,29 @@ database).
 
 ## API
 
-| Method | Path            | Purpose                                    |
-| ------ | --------------- | ------------------------------------------ |
-| GET    | `/api/health/`  | Liveness probe. Returns `{"status": "ok"}` |
-| —      | `/api/v1/`      | Versioned product API (added in Phase 2)   |
+| Method | Path                                            | Purpose                                    |
+| ------ | ----------------------------------------------- | ------------------------------------------ |
+| GET    | `/api/health/`                                  | Liveness probe. Returns `{"status": "ok"}` |
+| POST   | `/api/v1/specifications/`                       | Register a specification                   |
+| GET    | `/api/v1/specifications/`                       | List specifications                        |
+| GET    | `/api/v1/specifications/<id>/`                  | Retrieve one specification                 |
+| GET    | `/api/v1/specifications/<id>/endpoints/`        | Endpoints of a specification               |
+| POST   | `/api/v1/test-runs/`                            | Open a test run (starts `pending`)         |
+| GET    | `/api/v1/test-runs/`                            | List runs; `?specification=<id>` filters   |
+| GET    | `/api/v1/test-runs/<id>/`                       | Retrieve one run                           |
+| GET    | `/api/v1/test-runs/<id>/test-cases/`            | Test cases of a run                        |
+| GET    | `/api/v1/test-runs/<id>/findings/`              | Findings produced by a run                 |
 
 `/api/health/` is intentionally unversioned: it is an infrastructure probe, not
 part of the product contract.
+
+List responses are paginated (`{"count", "next", "previous", "results"}`); the
+page size comes from `API_PAGE_SIZE` and defaults to 50.
+
+A run's `status`, `started_at` and `completed_at` are owned by the system and
+ignored if a client sends them. Endpoints, test cases and evidence rows are
+written by the generator and executor in later phases, so they are read-only
+over HTTP for now.
 
 ## Configuration
 

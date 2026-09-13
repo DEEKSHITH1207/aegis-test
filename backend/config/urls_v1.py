@@ -5,4 +5,8 @@ reachable under /api/v1/ and a future v2 can be introduced without breaking
 existing clients.
 """
 
-urlpatterns: list = []
+from django.urls import include, path
+
+urlpatterns = [
+    path("", include("apps.testing.urls")),
+]

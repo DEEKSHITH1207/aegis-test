@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "apps.core",
+    "apps.testing",
 ]
 
 MIDDLEWARE = [
@@ -118,6 +119,13 @@ REST_FRAMEWORK = {
     # decision to revisit rather than an accidental default.
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    # List endpoints are paginated by default: a specification can describe
+    # hundreds of endpoints and a run can produce thousands of cases, and an
+    # unbounded list response is a denial-of-service waiting to happen.
+    # Service-layer validation errors become 400s instead of 500s.
+    "EXCEPTION_HANDLER": "apps.core.exceptions.api_exception_handler",
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": int(env("API_PAGE_SIZE", "50")),
 }
 
 # --- Internationalisation / static --------------------------------------------
