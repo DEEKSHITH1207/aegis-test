@@ -114,6 +114,42 @@ def parse(document: Any) -> ParsedDocument:
     )
 
 
+def documented_status_codes(document: Any, path: str, method: str) -> list[str]:
+    """The response codes a document declares for one operation.
+
+    ``parse`` keeps only the success *schema*, because that is what an Endpoint
+    stores; the codes themselves are needed later, when deciding what a test
+    case should expect. Reading them back out of the stored document keeps that
+    decision out of the import and off the model.
+
+    Returns an empty list for anything it cannot find, including a document that
+    would not parse: an absent expectation is the correct answer here, and an
+    exception would turn "this API documents nothing" into a failure.
+    """
+    if not isinstance(document, dict):
+        return []
+
+    paths = document.get("paths")
+    if not isinstance(paths, dict):
+        return []
+
+    path_item = paths.get(path)
+    if not isinstance(path_item, dict):
+        return []
+
+    operation = path_item.get(method.lower())
+    if not isinstance(operation, dict):
+        operation = path_item.get(method.upper())
+    if not isinstance(operation, dict):
+        return []
+
+    responses = operation.get("responses")
+    if not isinstance(responses, dict):
+        return []
+
+    return [code for code in responses if isinstance(code, str)]
+
+
 # --- Document-level validation ------------------------------------------------
 
 

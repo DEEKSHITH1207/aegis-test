@@ -69,7 +69,6 @@ class TestRunSerializer(serializers.ModelSerializer):
     # specification. Status and the timestamps are driven by the run's
     # lifecycle, never set by the client.
     name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
-
     class Meta:
         model = TestRun
         fields = [
@@ -90,6 +89,7 @@ class TestRunSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
 
 
 class TestCaseSerializer(serializers.ModelSerializer):
@@ -182,3 +182,19 @@ class ImportResultSerializer(serializers.Serializer):
 
     def get_unchanged(self, result) -> int:
         return len(result.unchanged)
+
+
+class GenerationResultSerializer(serializers.Serializer):
+    """The outcome of generating a run's test cases.
+
+    Counts rather than the cases themselves: a specification of any size
+    produces hundreds, and they are already listable on the run.
+    """
+
+    test_run_id = serializers.IntegerField()
+    endpoints = serializers.IntegerField()
+    created = serializers.IntegerField()
+    updated = serializers.IntegerField()
+    unchanged = serializers.IntegerField()
+    skipped = serializers.IntegerField()
+    warnings = serializers.ListField(child=serializers.CharField())

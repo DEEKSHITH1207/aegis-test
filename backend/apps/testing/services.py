@@ -19,7 +19,7 @@ from django.db import models, transaction
 from django.utils import timezone
 
 from apps.core.exceptions import DomainError
-from apps.testing import openapi
+from apps.testing import generator, openapi
 from apps.testing.models import (
     Endpoint,
     Finding,
@@ -263,6 +263,121 @@ def create_test_case(*, test_run: TestRun, endpoint: Endpoint, **fields: Any) ->
 
 def list_test_cases(*, test_run: TestRun) -> models.QuerySet[TestCase]:
     return test_run.test_cases.select_related("endpoint")
+
+
+# --- Generating test cases ----------------------------------------------------
+
+
+@dataclass
+class GenerationResult:
+    """What one generation pass did to a run's test cases."""
+
+    test_run_id: int
+    endpoints: int = 0
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    skipped: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+
+# The fields generation owns. A field outside this list is never touched, so a
+# value set by hand survives a re-generation.
+_GENERATED_TEST_CASE_FIELDS = (
+    "test_type",
+    "description",
+    "input_data",
+    "expected_status_code",
+)
+
+
+@transaction.atomic
+def generate_test_cases_for_run(*, test_run: TestRun) -> GenerationResult:
+    """Fill a pending run with the test cases its specification implies.
+
+    Generation is deterministic, so running it twice is not an error: a case is
+    identified by its run, its endpoint and its generated name, and a second
+    pass updates those cases in place rather than duplicating them.
+
+    The whole pass is one transaction. A run half-populated with test cases
+    would be executed as though it were complete and would under-report.
+    """
+    if test_run.status != TestRunStatus.PENDING:
+        # Adding cases to a run that has already executed would silently change
+        # what its results mean.
+        raise DomainError(
+            f"Test cases can only be generated for a pending run; this one is "
+            f"'{test_run.status}'."
+        )
+
+    result = GenerationResult(test_run_id=test_run.pk)
+    document = test_run.specification.raw_specification
+
+    existing = {
+        (case.endpoint_id, case.name): case
+        for case in test_run.test_cases.all()
+    }
+
+    for endpoint in test_run.specification.endpoints.all():
+        result.endpoints += 1
+
+        expected = generator.ExpectedStatus.from_codes(
+            openapi.documented_status_codes(document, endpoint.path, endpoint.method)
+        )
+        generated = generator.generate_test_cases(endpoint, expected=expected)
+        result.warnings.extend(generated.warnings)
+
+        if generated.is_empty:
+            result.skipped += 1
+            continue
+
+        for definition in generated.definitions:
+            case = existing.get((endpoint.pk, definition.name))
+            if case is None:
+                _create_generated_test_case(test_run, endpoint, definition)
+                result.created += 1
+            elif _apply_definition(case, definition):
+                result.updated += 1
+            else:
+                result.unchanged += 1
+
+    return result
+
+
+def _create_generated_test_case(
+    test_run: TestRun, endpoint: Endpoint, definition: generator.TestCaseDefinition
+) -> TestCase:
+    test_case = TestCase(
+        test_run=test_run,
+        endpoint=endpoint,
+        name=definition.name,
+        test_type=definition.test_type,
+        description=definition.description,
+        input_data=definition.input_data,
+        expected_status_code=definition.expected_status_code,
+    )
+    test_case.full_clean()
+    test_case.save()
+    return test_case
+
+
+def _apply_definition(
+    test_case: TestCase, definition: generator.TestCaseDefinition
+) -> bool:
+    """Bring an existing case in line with the definition. Did anything change?"""
+    changed = [
+        name
+        for name in _GENERATED_TEST_CASE_FIELDS
+        if getattr(test_case, name) != getattr(definition, name)
+    ]
+    if not changed:
+        return False
+
+    for name in changed:
+        setattr(test_case, name, getattr(definition, name))
+    test_case.full_clean()
+    test_case.save(update_fields=[*changed, "updated_at"])
+    return True
 
 
 # --- Findings -----------------------------------------------------------------

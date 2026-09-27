@@ -21,7 +21,8 @@ infrastructure: the health endpoint and the DRF exception handler that turns a
 service-layer validation error into a 400 rather than a 500.
 
 `apps.testing` owns the product domain — specifications, endpoints, runs, cases,
-evidence and findings — plus `openapi.py`, which reads specification documents. It is a single app rather than one app per model because
+evidence and findings — plus two pure modules: `openapi.py`, which reads
+specification documents, and `generator.py`, which decides what to test. It is a single app rather than one app per model because
 these seven models form one tightly connected graph with one lifecycle: they are
 always queried together and a specification's deletion removes all of them.
 Splitting them would create circular dependencies between apps and buy nothing.
@@ -152,3 +153,59 @@ Only `source_type` is copied back onto the specification from the document. Name
 and version are not: they identify the specification and are covered by a unique
 constraint, so overwriting them from a file could collide with another row or
 rename something a user is already working with.
+
+## Generating test cases
+
+```
+View  →  Service  →  Generator  →  TestCase rows
+```
+
+`apps/testing/generator.py` is pure in the same way `openapi.py` is: it reads an
+Endpoint's fields and returns dataclasses. It opens no database connection and
+imports nothing that can reach the network — a test asserts the latter against
+the module's own import list, because the whole point of this phase is that it
+describes requests without making any. Persistence stays in the service.
+
+Two properties do the real work.
+
+**Deterministic.** No randomness, no clock. The same schema always produces the
+same cases with the same names and values, which is what makes re-generation
+comparable and a failure reproducible. Property names are sorted before use, so
+the output does not depend on the key order a JSON column happens to return.
+
+**One violation per case.** An invalid case breaks exactly one rule and is
+otherwise a valid request. A body missing a field *and* carrying a malformed
+email cannot tell you which one the API rejected, and a case whose input is
+secretly valid reports a bug that does not exist. That second risk is why
+`pattern` is skipped with a warning rather than guessed at, why an enum gets no
+separate type case, and why a nullable field gets no null case.
+
+### Expected status codes
+
+`parse` keeps only the success *schema*, because that is what an Endpoint
+stores — the response codes themselves are not on the model. They are read back
+out of the stored document by `openapi.documented_status_codes` at generation
+time, which keeps the decision out of the import and off the schema.
+
+The rule is never to invent one: the lowest documented 2xx for a happy path;
+400, then 422, then the lowest other 4xx for a rejected request; and `null` when
+the document promises neither. `TestCase.expected_status_code` is nullable for
+exactly this reason. A null expectation is not a gap — a case with no documented
+answer still records what the API did, and a 5xx is a finding whatever the
+document says.
+
+### Identity and re-generation
+
+A generated case is identified by `(test_run, endpoint, name)`, and its name is
+deterministic, so a second pass matches the rows it wrote the first time and
+updates them in place. No database constraint enforces this: generation is the
+only writer of these names, and a hand-authored case should not be forbidden
+from reusing one. The service owns the rule, and a test asserts that generating
+three times leaves the row count unchanged.
+
+Only the fields generation produces are rewritten, so a value set by any other
+means survives. The pass is one transaction: a run half-populated with test
+cases would be executed as though it were complete, and would under-report.
+
+Generation is refused unless the run is `pending`. Adding cases to a run that has
+already executed would silently change what its results mean.

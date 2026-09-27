@@ -57,9 +57,27 @@ class TestRunStatus(models.TextChoices):
 
 
 class TestCaseType(models.TextChoices):
-    """What a test case is trying to prove."""
+    """What a test case is trying to prove.
+
+    The validation types name the single constraint a case violates, because a
+    test that says only "invalid input" cannot explain a failure. Each generated
+    case breaks exactly one rule, so its type is the diagnosis.
+    """
 
     HAPPY_PATH = "happy_path", "Happy path"
+
+    # One violated constraint each, produced by the generator.
+    MISSING_REQUIRED = "missing_required", "Missing required field"
+    EMPTY_VALUE = "empty_value", "Empty value for a required field"
+    INVALID_TYPE = "invalid_type", "Wrong JSON type"
+    INVALID_FORMAT = "invalid_format", "Malformed string format"
+    INVALID_ENUM = "invalid_enum", "Value outside the enum"
+    BELOW_MINIMUM = "below_minimum", "Below the minimum"
+    ABOVE_MAXIMUM = "above_maximum", "Above the maximum"
+    BELOW_MIN_LENGTH = "below_min_length", "Shorter than the minimum length"
+    ABOVE_MAX_LENGTH = "above_max_length", "Longer than the maximum length"
+
+    # Coarser kinds, for cases written by hand or by later phases.
     VALIDATION = "validation", "Input validation"
     AUTHENTICATION = "authentication", "Authentication"
     AUTHORIZATION = "authorization", "Authorization"
@@ -263,11 +281,17 @@ class TestCase(TimeStampedModel):
         default=dict,
         help_text="Inputs for the request: body, query, path and header values.",
     )
+    # Null means the specification documents no status code for this case, so
+    # AegisTest has no expectation to assert. Inventing one — assuming every API
+    # answers an invalid body with 400 — would manufacture failures against APIs
+    # that simply chose 422, or that document nothing at all.
     expected_status_code = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
         validators=[
             MinValueValidator(MIN_HTTP_STATUS_CODE),
             MaxValueValidator(MAX_HTTP_STATUS_CODE),
-        ]
+        ],
     )
     status = models.CharField(
         max_length=16, choices=TestCaseStatus.choices, default=TestCaseStatus.PENDING

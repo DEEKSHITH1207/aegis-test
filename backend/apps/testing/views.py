@@ -18,6 +18,7 @@ from apps.testing.models import Specification, TestRun
 from apps.testing.serializers import (
     EndpointSerializer,
     FindingSerializer,
+    GenerationResultSerializer,
     ImportResultSerializer,
     SpecificationSerializer,
     TestCaseSerializer,
@@ -89,6 +90,19 @@ class TestRunDetailView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         return services.list_test_runs()
+
+
+class TestRunGenerateTestsView(APIView):
+    """Generate the test cases for a run from its specification's endpoints.
+
+    Returns 200, not 201: the call is idempotent and a repeat run of it
+    legitimately creates nothing.
+    """
+
+    def post(self, request: Request, test_run_id: int) -> Response:
+        test_run = get_object_or_404(TestRun, pk=test_run_id)
+        result = services.generate_test_cases_for_run(test_run=test_run)
+        return Response(GenerationResultSerializer(result).data, status=status.HTTP_200_OK)
 
 
 class TestRunTestCaseListView(generics.ListAPIView):

@@ -32,6 +32,11 @@ urlpatterns = [
     path("test-runs/", views.TestRunListCreateView.as_view(), name="test-run-list"),
     path("test-runs/<int:pk>/", views.TestRunDetailView.as_view(), name="test-run-detail"),
     path(
+        "test-runs/<int:test_run_id>/generate-tests/",
+        views.TestRunGenerateTestsView.as_view(),
+        name="test-run-generate-tests",
+    ),
+    path(
         "test-runs/<int:test_run_id>/test-cases/",
         views.TestRunTestCaseListView.as_view(),
         name="test-run-test-case-list",
