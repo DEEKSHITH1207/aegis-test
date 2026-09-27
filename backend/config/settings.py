@@ -112,6 +112,24 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 
+# In development without a worker, set this to run tasks inside the request
+# that queues them. A whole test run then executes before the response returns.
+CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", default=False)
+
+# --- Test execution -----------------------------------------------------------
+
+# Seconds to wait for the target to connect and answer each request.
+EXECUTOR_TIMEOUT_SECONDS = float(env("EXECUTOR_TIMEOUT_SECONDS", "10"))
+# Response bodies are read up to this size; the rest is discarded.
+EXECUTOR_MAX_RESPONSE_BYTES = int(env("EXECUTOR_MAX_RESPONSE_BYTES", "1048576"))
+# Set to false only to test an API served with a self-signed certificate.
+EXECUTOR_VERIFY_TLS = env_bool("EXECUTOR_VERIFY_TLS", default=True)
+# Hosts a run may send requests to. Empty allows any host. Anyone who can reach
+# this API can make the server issue requests to any host it can reach, so set
+# this on any deployment that is not a single user's machine. A leading dot
+# allows subdomains: ".example.com".
+EXECUTOR_ALLOWED_HOSTS = env_list("EXECUTOR_ALLOWED_HOSTS", "")
+
 # --- REST framework -----------------------------------------------------------
 
 REST_FRAMEWORK = {
@@ -157,4 +175,6 @@ LOGGING = {
         "console": {"class": "logging.StreamHandler", "formatter": "simple"},
     },
     "root": {"handlers": ["console"], "level": env("DJANGO_LOG_LEVEL", "INFO")},
+    # httpx logs every request at INFO; a test run sends hundreds.
+    "loggers": {"httpx": {"level": "WARNING"}},
 }

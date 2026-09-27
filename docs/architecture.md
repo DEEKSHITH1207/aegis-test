@@ -62,9 +62,10 @@ alongside `v1` rather than breaking existing clients.
 
 `config/celery.py` defines the Celery app and reads its configuration from
 Django settings via the `CELERY_` namespace, so there is a single place to
-configure the queue. There are still no tasks and no worker service — those
-arrive with the test executor, when there is real work to run. Phase 2 added the
-data model those tasks will write to, not the tasks themselves.
+configure the queue. The one task, `apps/testing/tasks.py`, executes a test
+run; the `worker` service in `docker-compose.yml` consumes it. The task is a
+thin wrapper around `services.execute_test_run`, which the
+`execute_test_run` management command also calls directly.
 
 ## Domain model
 
@@ -209,3 +210,61 @@ cases would be executed as though it were complete, and would under-report.
 
 Generation is refused unless the run is `pending`. Adding cases to a run that has
 already executed would silently change what its results mean.
+
+## Executing a run
+
+```
+View ─ start_execution ─(on commit)→ Celery task ─ execute_test_run
+                                                     │ per case:
+                                     executor.prepare → executor.send
+                                                     → RequestRecord / ResponseRecord
+                                     evaluation.evaluate → TestCase.status, Findings
+```
+
+Three modules, each with one job:
+
+- `executor.py` is the **only** module that reaches the network. It builds a
+  request from a case's `input_data`, sends it, and returns what came back.
+  It never raises for anything the target does — a timeout or refused
+  connection is a result, not an exception — so one bad case cannot end a run.
+- `evaluation.py` is pure: status code and expectation in, verdict and
+  finding drafts out. The rules live in one function and are tested as plain
+  calls.
+- `services.py` sequences them and owns persistence.
+
+**Starting is separate from executing.** `start_execution` locks the run,
+checks it is pending, has a usable base URL and has cases, and moves it to
+`running` in one transaction; the task is queued `on_commit`, so a worker never
+picks up a run that is still pending. If queueing itself fails — Redis is down
+— the run is marked `failed` rather than left `running` with nothing working
+on it.
+
+**Each case commits on its own.** Progress is visible while a run executes,
+and a crash loses only the case in flight. A run does not execute twice:
+re-running would mix two sets of evidence under one set of cases.
+
+**Evidence is recorded before it is judged,** and credentials are redacted
+before they are recorded. A run's `headers` stay in the database so the worker
+can send them, but never appear in a response, a `RequestRecord` or a finding.
+
+**Unreachable targets stop early.** If the first three requests cannot
+connect, every remaining case would wait out the same failure; the run stops
+with the rest `skipped`. Once the target has answered, a later connection
+failure is recorded against its case and the run continues — an API that falls
+over mid-run is itself worth seeing.
+
+### Why 401, 403 and 429 are not verdicts
+
+A case exists to test one rule. A request refused for missing credentials, or
+rate-limited, never reached the code that enforces that rule, so passing or
+failing it would be claiming something the response does not show. Such cases
+are `error`, with a detail pointing at the run's headers.
+
+### Outbound requests
+
+Executing a run makes the server send requests to a host its caller chose.
+That is the product, but combined with an API that has no authentication it is
+also a server-side request forgery surface. `EXECUTOR_ALLOWED_HOSTS` restricts
+the hosts a run may target and is checked when the run is created and again
+when it executes. Redirects are not followed, so an allowed host cannot bounce a
+request to one that is not.

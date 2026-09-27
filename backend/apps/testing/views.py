@@ -2,7 +2,7 @@
 
 Every view does three things and nothing else: resolve its inputs, call a
 service, hand the result to a serializer. There is no business logic here, so
-the same operations remain callable from a Celery task in a later phase.
+the same operations remain callable from a Celery task.
 """
 
 from __future__ import annotations
@@ -105,14 +105,30 @@ class TestRunGenerateTestsView(APIView):
         return Response(GenerationResultSerializer(result).data, status=status.HTTP_200_OK)
 
 
+class TestRunExecuteView(APIView):
+    """Start sending a run's requests to its base URL.
+
+    Returns 202: the run is handed to a worker and executes in the background.
+    Poll the run to follow its progress; its ``results`` fill in as cases finish.
+    """
+
+    def post(self, request: Request, test_run_id: int) -> Response:
+        test_run = get_object_or_404(TestRun, pk=test_run_id)
+        test_run = services.start_execution(test_run=test_run)
+        test_run = services.list_test_runs().get(pk=test_run.pk)
+        return Response(TestRunSerializer(test_run).data, status=status.HTTP_202_ACCEPTED)
+
+
 class TestRunTestCaseListView(generics.ListAPIView):
-    """Test cases belonging to one run."""
+    """Test cases belonging to one run, optionally filtered by ?status=failed."""
 
     serializer_class = TestCaseSerializer
 
     def get_queryset(self):
         test_run = get_object_or_404(TestRun, pk=self.kwargs["test_run_id"])
-        return services.list_test_cases(test_run=test_run)
+        return services.list_test_cases(
+            test_run=test_run, status=self.request.query_params.get("status")
+        )
 
 
 class TestRunFindingListView(generics.ListAPIView):

@@ -7,11 +7,10 @@ cases against a target API, analyses the responses, and reports bugs, validation
 gaps, inconsistencies and security issues. An LLM is used as a reasoning layer
 over the collected evidence — never as the sole source of truth.
 
-**Status: Phase 4 — test-case generation.** AegisTest reads an OpenAPI 3.x or
-Swagger 2.0 document, turns it into endpoints, and generates a deterministic
-suite of test cases from their schemas. Execution and LLM analysis come in later
-phases: **nothing here sends an HTTP request to a target API.** Phase 4 writes
-`TestCase` rows and nothing else.
+**Status: Phase 5 — test execution.** AegisTest reads an OpenAPI 3.x or
+Swagger 2.0 document, turns it into endpoints, generates a deterministic suite of
+test cases from their schemas, sends each one to the API under test, and records
+what came back as evidence and findings. LLM analysis comes in a later phase.
 
 ## Architecture
 
@@ -19,9 +18,9 @@ phases: **nothing here sends an HTTP request to a target API.** Phase 4 writes
 React frontend (later)
         |
         v
-  Django REST API  ----> PostgreSQL
-        |
-        +------------->  Redis  ---->  Celery worker (later phases)
+  Django REST API  ----> PostgreSQL <----+
+        |                                |
+        +------------->  Redis  ---->  Celery worker ----> API under test
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the request flow and the
@@ -76,6 +75,7 @@ Useful commands:
 
 ```bash
 docker compose logs -f backend
+docker compose logs -f worker      # watch test runs execute
 docker compose exec backend pytest
 docker compose down          # add -v to also drop the database volume
 ```
@@ -129,7 +129,8 @@ database).
 | GET    | `/api/v1/test-runs/`                            | List runs; `?specification=<id>` filters   |
 | GET    | `/api/v1/test-runs/<id>/`                       | Retrieve one run                           |
 | POST   | `/api/v1/test-runs/<id>/generate-tests/`        | Generate the run's test cases              |
-| GET    | `/api/v1/test-runs/<id>/test-cases/`            | Test cases of a run                        |
+| POST   | `/api/v1/test-runs/<id>/execute/`               | Send the run's requests (202, background)  |
+| GET    | `/api/v1/test-runs/<id>/test-cases/`            | Test cases; `?status=failed` filters       |
 | GET    | `/api/v1/test-runs/<id>/findings/`              | Findings produced by a run                 |
 
 `/api/health/` is intentionally unversioned: it is an infrastructure probe, not
@@ -138,9 +139,9 @@ part of the product contract.
 List responses are paginated (`{"count", "next", "previous", "results"}`); the
 page size comes from `API_PAGE_SIZE` and defaults to 50.
 
-A run's `status`, `started_at` and `completed_at` are owned by the system and
-ignored if a client sends them. Test cases and evidence rows are written by the
-generator and executor in later phases, so they are read-only over HTTP for now.
+A run's `status`, `status_detail`, `started_at` and `completed_at` are owned by
+the system and ignored if a client sends them. Test cases and evidence rows are
+written by the generator and the executor, so they are read-only over HTTP.
 
 ## Importing a specification
 
@@ -202,7 +203,7 @@ curl -X POST http://localhost:8000/api/v1/test-runs/1/generate-tests/
 ```
 
 **This does not call the API under test.** Generation only writes rows; sending
-the requests they describe is a later phase.
+the requests they describe is [execution](#executing-a-run), a separate step.
 
 ### What a generated case looks like
 
@@ -310,3 +311,101 @@ that has already executed would silently change what its results mean.
 - Path parameters get no `missing_required` case: the URL would no longer
   address the operation, so the result would say nothing about it.
 - `multipleOf`, `additionalProperties` and cookie parameters are not covered.
+
+## Executing a run
+
+Execution sends every generated case to the API under test, records the request
+and response, and judges the result. Point a run at your API when you create it:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/test-runs/ \
+     -H 'Content-Type: application/json' \
+     -d '{"specification": 1,
+          "base_url": "http://host.docker.internal:3000",
+          "headers": {"Authorization": "Bearer <token>"}}'
+
+curl -X POST http://localhost:8000/api/v1/test-runs/1/generate-tests/
+curl -X POST http://localhost:8000/api/v1/test-runs/1/execute/      # 202, runs on the worker
+curl http://localhost:8000/api/v1/test-runs/1/                      # poll: status + results
+curl http://localhost:8000/api/v1/test-runs/1/findings/
+curl 'http://localhost:8000/api/v1/test-runs/1/test-cases/?status=failed'
+```
+
+`base_url` is joined with each endpoint's path, so include any prefix the paths
+in your document leave out (`http://localhost:3000/api`). From inside Docker,
+`localhost` is the container itself: an API running on your machine is
+`http://host.docker.internal:<port>`.
+
+`headers` are sent with every request. They are **write-only** — the API
+returns only `header_names` — and credential-like headers (`Authorization`,
+`Cookie`, anything containing `token`, `key`, `secret`, `auth`) are redacted in
+the stored request records and findings. They are stored in the database in
+plain text, so treat the database as holding your API credentials.
+
+Without a worker — running Django on the host — execute in the foreground:
+
+```bash
+python manage.py execute_test_run 1
+# Run 1 completed: 48 sent, 31 passed, 15 failed, 2 errors, 0 skipped, 15 findings.
+```
+
+or set `CELERY_TASK_ALWAYS_EAGER=True` to run the task inside the `execute/`
+request itself.
+
+### How a response is judged
+
+Rules apply in this order:
+
+| Response | Case | Finding |
+| --- | --- | --- |
+| 5xx | `failed` | **bug**, high — the input was not handled |
+| 2xx to an invalid case | `failed` | **validation_gap**, medium — forbidden input was accepted |
+| 401 / 403 / 429 not documented for the case | `error` | none — the request was refused before the API looked at it; usually missing credentials |
+| A code other than the documented one | `failed` | **inconsistency**, low |
+| Anything else | `passed` | none |
+
+A case with no documented code passes on anything not ruled out above: asserting
+a code the document never promised would manufacture failures. Every finding
+carries its evidence — the request sent, the status, and an excerpt of the body —
+and links to the full `ResponseRecord`.
+
+A happy path that answers 404 is reported, with a note: generated sample values
+(`userId: 1`) may simply not exist in your API's data, in which case the finding
+is a false positive to mark as such.
+
+### Run lifecycle
+
+`execute/` checks the run is `pending`, has a usable `base_url` and has test
+cases, then moves it to `running` and queues it. The run ends `completed` once
+every case has been sent, or `failed` with a `status_detail` saying why. The
+run's `results` count cases per status while it executes, so polling it shows
+progress. A run executes once; to test again, create a new run.
+
+- A timeout or refused connection marks that case `error` and the run carries on.
+- If the first three requests all fail to connect, the target is taken to be
+  unreachable: the run stops, the rest are `skipped`, and the run is `failed`.
+- Redirects are recorded, not followed. Response bodies are read up to
+  `EXECUTOR_MAX_RESPONSE_BYTES`.
+
+### Settings
+
+| Variable | Default | |
+| --- | --- | --- |
+| `EXECUTOR_TIMEOUT_SECONDS` | `10` | Per request |
+| `EXECUTOR_MAX_RESPONSE_BYTES` | `1048576` | Larger bodies are truncated |
+| `EXECUTOR_VERIFY_TLS` | `True` | `False` only for self-signed certificates |
+| `EXECUTOR_ALLOWED_HOSTS` | empty (any) | Comma-separated; `.example.com` allows subdomains |
+
+**`EXECUTOR_ALLOWED_HOSTS` matters.** The AegisTest API has no authentication
+yet, so anyone who can reach it can make the server send requests to any host
+*it* can reach — internal services, cloud metadata endpoints. Leave it empty
+only on your own machine.
+
+### Execution limitations
+
+- Request bodies are sent as JSON, whatever media type the document declares.
+- Response bodies are not yet validated against the documented response schema.
+- A run stuck in `running` because its worker died stays there; there is no
+  cancel or retry yet.
+- The same credentials are used for every case: there are no authentication or
+  authorisation cases yet.

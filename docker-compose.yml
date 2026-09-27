@@ -38,6 +38,29 @@ services:
       - ./backend:/app
     ports:
       - "8000:8000"
+    # Lets a run reach an API served on the host machine at
+    # http://host.docker.internal:<port>. Built into Docker Desktop; this
+    # line provides it on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Executes test runs: sends each case's request to the run's base URL.
+  worker:
+    build: ./backend
+    command: celery -A config worker --loglevel=info
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

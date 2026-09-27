@@ -12,6 +12,7 @@ from typing import Any
 
 from rest_framework import serializers
 
+from apps.testing import services
 from apps.testing.models import (
     Endpoint,
     Finding,
@@ -69,13 +70,26 @@ class TestRunSerializer(serializers.ModelSerializer):
     # specification. Status and the timestamps are driven by the run's
     # lifecycle, never set by the client.
     name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    # Headers usually carry credentials, so they are accepted but never
+    # returned. Their names are, so a client can see what is configured.
+    headers = serializers.DictField(
+        child=serializers.CharField(allow_blank=True), required=False, write_only=True
+    )
+    header_names = serializers.SerializerMethodField()
+    results = serializers.SerializerMethodField()
+
     class Meta:
         model = TestRun
         fields = [
             "id",
             "specification",
             "name",
+            "base_url",
+            "headers",
+            "header_names",
             "status",
+            "status_detail",
+            "results",
             "started_at",
             "completed_at",
             "created_at",
@@ -84,12 +98,18 @@ class TestRunSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id",
             "status",
+            "status_detail",
             "started_at",
             "completed_at",
             "created_at",
             "updated_at",
         ]
 
+    def get_header_names(self, test_run: TestRun) -> list[str]:
+        return sorted(test_run.headers) if isinstance(test_run.headers, dict) else []
+
+    def get_results(self, test_run: TestRun) -> dict[str, int]:
+        return services.summarise_test_run(test_run)
 
 
 class TestCaseSerializer(serializers.ModelSerializer):
@@ -105,10 +125,11 @@ class TestCaseSerializer(serializers.ModelSerializer):
             "input_data",
             "expected_status_code",
             "status",
+            "status_detail",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "status", "created_at", "updated_at"]
+        read_only_fields = ["id", "status", "status_detail", "created_at", "updated_at"]
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         test_run = attrs.get("test_run")

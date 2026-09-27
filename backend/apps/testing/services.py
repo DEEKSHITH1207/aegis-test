@@ -1,8 +1,9 @@
 """Business operations for the testing domain.
 
 Views parse input and serialise output; everything between those two steps
-lives here. Keeping it in plain functions means a Celery task in a later phase
-can call exactly the same code as an HTTP request, with no view layer involved.
+lives here. Keeping it in plain functions means the Celery task and the
+management command call exactly the same code as an HTTP request, with no view
+layer involved.
 
 Read helpers return querysets rather than lists so the caller can still filter,
 paginate or count without loading rows it will not use.
@@ -10,24 +11,32 @@ paginate or count without loading rows it will not use.
 
 from __future__ import annotations
 
+import json
+import logging
+from dataclasses import dataclass, field
 from typing import Any
 
-from dataclasses import dataclass, field
-
+import httpx
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 
 from apps.core.exceptions import DomainError
-from apps.testing import generator, openapi
+from apps.testing import evaluation, executor, generator, openapi
 from apps.testing.models import (
     Endpoint,
     Finding,
+    RequestRecord,
+    ResponseRecord,
     Specification,
     TestCase,
+    TestCaseStatus,
     TestRun,
     TestRunStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 # DomainError is imported rather than defined here: it is raised by this module
 # and translated to HTTP 400 by the handler in apps.core.exceptions.
@@ -206,8 +215,32 @@ def create_test_run(*, specification: Specification, name: str = "", **fields: A
         **fields,
     )
     test_run.full_clean()
+    _validate_target(test_run)
     test_run.save()
     return test_run
+
+
+def _validate_target(test_run: TestRun) -> None:
+    """Check where a run will send its requests, and what it will send along.
+
+    An empty base URL is allowed while a run is only being prepared; executing
+    it is what requires one.
+    """
+    errors: dict[str, str] = {}
+    if test_run.base_url:
+        problem = executor.base_url_problem(test_run.base_url, settings.EXECUTOR_ALLOWED_HOSTS)
+        if problem:
+            errors["base_url"] = problem
+
+    headers = test_run.headers
+    if not isinstance(headers, dict) or not all(
+        isinstance(name, str) and name and isinstance(value, str)
+        for name, value in headers.items()
+    ):
+        errors["headers"] = "Headers must be an object mapping header names to string values."
+
+    if errors:
+        raise ValidationError(errors)
 
 
 def _default_test_run_name(specification: Specification) -> str:
@@ -215,11 +248,44 @@ def _default_test_run_name(specification: Specification) -> str:
     return f"{specification.name} - {stamp}"[:255]
 
 
+# The per-status counts reported on a run. Annotated in the list query rather
+# than computed per row, so a page of runs costs one query, not fifty.
+_RESULT_COUNTS = {
+    f"{status}_count": models.Count(
+        "test_cases", filter=models.Q(test_cases__status=status), distinct=True
+    )
+    for status in TestCaseStatus.values
+}
+
+
 def list_test_runs(*, specification: Specification | None = None) -> models.QuerySet[TestRun]:
-    queryset = TestRun.objects.select_related("specification")
+    # Django drops Meta.ordering from an aggregating query, so it is restated.
+    queryset = (
+        TestRun.objects.select_related("specification")
+        .annotate(
+            total_count=models.Count("test_cases", distinct=True),
+            findings_count=models.Count("test_cases__findings", distinct=True),
+            **_RESULT_COUNTS,
+        )
+        .order_by(*TestRun._meta.ordering)
+    )
     if specification is not None:
         queryset = queryset.filter(specification=specification)
     return queryset
+
+
+def summarise_test_run(test_run: TestRun) -> dict[str, int]:
+    """How a run's cases stand: a count per status, a total, and findings.
+
+    Uses the annotations from :func:`list_test_runs` when the run came from
+    there, and queries for them otherwise.
+    """
+    if not hasattr(test_run, "total_count"):
+        test_run = list_test_runs().get(pk=test_run.pk)
+    summary = {"total": test_run.total_count}
+    summary.update({status: getattr(test_run, f"{status}_count") for status in TestCaseStatus.values})
+    summary["findings"] = test_run.findings_count
+    return summary
 
 
 def start_test_run(test_run: TestRun) -> TestRun:
@@ -261,8 +327,15 @@ def create_test_case(*, test_run: TestRun, endpoint: Endpoint, **fields: Any) ->
     return test_case
 
 
-def list_test_cases(*, test_run: TestRun) -> models.QuerySet[TestCase]:
-    return test_run.test_cases.select_related("endpoint")
+def list_test_cases(*, test_run: TestRun, status: str | None = None) -> models.QuerySet[TestCase]:
+    queryset = test_run.test_cases.select_related("endpoint")
+    if status:
+        if status not in TestCaseStatus.values:
+            raise ValidationError(
+                {"status": f"Must be one of: {', '.join(TestCaseStatus.values)}."}
+            )
+        queryset = queryset.filter(status=status)
+    return queryset
 
 
 # --- Generating test cases ----------------------------------------------------
@@ -378,6 +451,267 @@ def _apply_definition(
     test_case.full_clean()
     test_case.save(update_fields=[*changed, "updated_at"])
     return True
+
+
+# --- Executing a run ----------------------------------------------------------
+
+# A run whose first requests cannot even connect is pointed at the wrong place.
+# Stopping after a few saves waiting out a timeout for every remaining case.
+_UNREACHABLE_AFTER = 3
+
+
+@dataclass
+class ExecutionSummary:
+    """What one execution pass did."""
+
+    test_run_id: int
+    executed: int = 0
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
+    skipped: int = 0
+    findings: int = 0
+
+
+def start_execution(*, test_run: TestRun, enqueue: bool = True) -> TestRun:
+    """Check a run can execute, mark it RUNNING, and hand it to the worker.
+
+    The run is locked while it is checked and started, so two simultaneous
+    requests cannot both start it. The task is queued only once that commits:
+    a worker picking it up earlier would find the run still pending.
+
+    ``enqueue=False`` starts the run without queueing it, for a caller that
+    executes it itself, such as the management command.
+    """
+    with transaction.atomic():
+        test_run = TestRun.objects.select_for_update().get(pk=test_run.pk)
+        if test_run.status != TestRunStatus.PENDING:
+            raise DomainError(
+                f"Only a pending run can be executed; this one is '{test_run.status}'. "
+                f"Create a new run to test again."
+            )
+        problem = executor.base_url_problem(test_run.base_url, settings.EXECUTOR_ALLOWED_HOSTS)
+        if problem:
+            raise ValidationError({"base_url": problem})
+        if not test_run.test_cases.exists():
+            raise DomainError("The run has no test cases; generate them before executing it.")
+
+        start_test_run(test_run)
+        if enqueue:
+            transaction.on_commit(lambda: _enqueue_execution(test_run.pk))
+
+    test_run.refresh_from_db()
+    return test_run
+
+
+def _enqueue_execution(test_run_id: int) -> None:
+    # Imported here: tasks imports this module.
+    from apps.testing.tasks import execute_test_run_task
+
+    try:
+        execute_test_run_task.delay(test_run_id)
+    except Exception as exc:
+        # Without this the run would sit in RUNNING forever with nothing
+        # working on it.
+        logger.exception("Could not queue test run %s", test_run_id)
+        test_run = TestRun.objects.get(pk=test_run_id)
+        _fail_run(test_run, f"The run could not be queued for execution: {exc}")
+
+
+def execute_test_run(
+    *, test_run: TestRun, client: httpx.Client | None = None
+) -> ExecutionSummary:
+    """Send every pending case of a RUNNING run and record what happened.
+
+    Each case is committed as soon as it is judged, so progress is visible
+    while the run is under way and a crash loses only the case in flight. A
+    case whose request fails does not stop the run; a target that cannot be
+    reached at all does.
+    """
+    if test_run.status != TestRunStatus.RUNNING:
+        raise DomainError(f"Only a running run can be executed; this one is '{test_run.status}'.")
+
+    summary = ExecutionSummary(test_run_id=test_run.pk)
+    owns_client = client is None
+    if client is None:
+        client = executor.make_client(
+            timeout=settings.EXECUTOR_TIMEOUT_SECONDS, verify_tls=settings.EXECUTOR_VERIFY_TLS
+        )
+
+    try:
+        problem = executor.base_url_problem(test_run.base_url, settings.EXECUTOR_ALLOWED_HOSTS)
+        if problem:
+            # The allow-list may have changed since the run was started.
+            _fail_run(test_run, problem)
+            return summary
+
+        cases = test_run.test_cases.filter(status=TestCaseStatus.PENDING).select_related(
+            "endpoint"
+        )
+        unreachable = 0
+        reached = False
+        for test_case in cases.order_by("id").iterator():
+            result, findings = _execute_case(test_run, test_case, client)
+            _tally(summary, test_case)
+            summary.findings += findings
+
+            if result.status_code is not None:
+                reached = True
+            elif result.connection_failed and not reached:
+                unreachable += 1
+                if unreachable >= _UNREACHABLE_AFTER:
+                    summary.skipped += _skip_remaining(
+                        test_run, "Not sent: the target could not be reached."
+                    )
+                    _fail_run(
+                        test_run,
+                        f"Stopped after {unreachable} requests could not connect to "
+                        f"{test_run.base_url}: {result.error}",
+                    )
+                    return summary
+
+        complete_test_run(test_run)
+    except Exception as exc:
+        _fail_run(test_run, f"Execution stopped unexpectedly: {exc}")
+        raise
+    finally:
+        if owns_client:
+            client.close()
+
+    return summary
+
+
+def _execute_case(
+    test_run: TestRun, test_case: TestCase, client: httpx.Client
+) -> tuple[executor.ExecutionResult, int]:
+    """Send one case, record the evidence, judge it. Returns the result and
+    the number of findings it produced."""
+    endpoint = test_case.endpoint
+    prepared = executor.prepare(
+        method=endpoint.method,
+        path=endpoint.path,
+        input_data=test_case.input_data if isinstance(test_case.input_data, dict) else {},
+        base_url=test_run.base_url,
+        run_headers=test_run.headers,
+    )
+    result = executor.send(
+        prepared, client=client, max_response_bytes=settings.EXECUTOR_MAX_RESPONSE_BYTES
+    )
+
+    findings = 0
+    with transaction.atomic():
+        request_record = RequestRecord.objects.create(
+            test_case=test_case,
+            method=prepared.method,
+            url=prepared.url[: RequestRecord._meta.get_field("url").max_length],
+            headers=executor.redact_headers(prepared.headers),
+            query_params=prepared.query_params,
+            path_params=prepared.path_params,
+            body=prepared.body,
+            error=result.error,
+        )
+
+        if result.status_code is None:
+            test_case.status = TestCaseStatus.ERROR
+            test_case.status_detail = result.error
+        else:
+            response_record = ResponseRecord.objects.create(
+                request_record=request_record,
+                status_code=result.status_code,
+                headers=executor.redact_headers(result.headers),
+                body=result.body,
+                response_time_ms=result.response_time_ms,
+            )
+            verdict = evaluation.evaluate(
+                label=f"{endpoint.method} {endpoint.path}",
+                case_name=test_case.name,
+                test_type=test_case.test_type,
+                expected_status_code=test_case.expected_status_code,
+                status_code=result.status_code,
+            )
+            test_case.status = verdict.status
+            test_case.status_detail = verdict.detail
+            for draft in verdict.findings:
+                Finding.objects.create(
+                    test_case=test_case,
+                    response_record=response_record,
+                    title=draft.title[: Finding._meta.get_field("title").max_length],
+                    description=draft.description,
+                    severity=draft.severity,
+                    category=draft.category,
+                    evidence=_evidence(test_case, prepared, result),
+                )
+                findings += 1
+
+        test_case.save(update_fields=["status", "status_detail", "updated_at"])
+
+    return result, findings
+
+
+# Enough of a response body to see what the API said, without copying a large
+# payload into every finding.
+_EVIDENCE_BODY_MAX_CHARS = 2_000
+
+
+def _evidence(
+    test_case: TestCase,
+    prepared: executor.PreparedRequest,
+    result: executor.ExecutionResult,
+) -> dict[str, Any]:
+    """A finding's self-contained support: what was sent, and what came back."""
+    body = result.body
+    if body is not None:
+        rendered = body if isinstance(body, str) else json.dumps(body)
+        if len(rendered) > _EVIDENCE_BODY_MAX_CHARS:
+            body = rendered[:_EVIDENCE_BODY_MAX_CHARS] + " [truncated]"
+
+    return {
+        "test_type": test_case.test_type,
+        "expected_status_code": test_case.expected_status_code,
+        "request": {
+            "method": prepared.method,
+            "url": prepared.url,
+            "query": prepared.query_params,
+            "headers": executor.redact_headers(prepared.headers),
+            "body": prepared.body,
+        },
+        "response": {
+            "status_code": result.status_code,
+            "response_time_ms": result.response_time_ms,
+            "body": body,
+        },
+    }
+
+
+def _tally(summary: ExecutionSummary, test_case: TestCase) -> None:
+    summary.executed += 1
+    if test_case.status == TestCaseStatus.PASSED:
+        summary.passed += 1
+    elif test_case.status == TestCaseStatus.FAILED:
+        summary.failed += 1
+    else:
+        summary.errors += 1
+
+
+def _skip_remaining(test_run: TestRun, detail: str) -> int:
+    return test_run.test_cases.filter(status=TestCaseStatus.PENDING).update(
+        status=TestCaseStatus.SKIPPED, status_detail=detail, updated_at=timezone.now()
+    )
+
+
+def _fail_run(test_run: TestRun, detail: str) -> None:
+    """End a run as FAILED, from whichever state it was left in."""
+    test_run.refresh_from_db()
+    if test_run.is_finished:
+        return
+    now = timezone.now()
+    test_run.status = TestRunStatus.FAILED
+    test_run.status_detail = detail
+    test_run.started_at = test_run.started_at or now
+    test_run.completed_at = now
+    test_run.save(
+        update_fields=["status", "status_detail", "started_at", "completed_at", "updated_at"]
+    )
 
 
 # --- Findings -----------------------------------------------------------------

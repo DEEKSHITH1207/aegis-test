@@ -228,6 +228,23 @@ class TestRun(TimeStampedModel):
     status = models.CharField(
         max_length=16, choices=TestRunStatus.choices, default=TestRunStatus.PENDING
     )
+    # Where the run sends its requests. A CharField rather than a URLField:
+    # Django's URL validator rejects single-label hosts such as
+    # http://api:8080, which is exactly how a service is named inside Docker.
+    base_url = models.CharField(
+        max_length=2000,
+        blank=True,
+        default="",
+        help_text="Root URL of the API under test, e.g. http://localhost:3000/api.",
+    )
+    # Sent with every request of the run — typically credentials. Never
+    # returned by the API and redacted from the stored request evidence.
+    headers = models.JSONField(
+        blank=True, default=dict, help_text="Headers added to every request, e.g. Authorization."
+    )
+    status_detail = models.TextField(
+        blank=True, default="", help_text="Why the run ended as it did, when that needs saying."
+    )
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
@@ -296,6 +313,9 @@ class TestCase(TimeStampedModel):
     status = models.CharField(
         max_length=16, choices=TestCaseStatus.choices, default=TestCaseStatus.PENDING
     )
+    status_detail = models.TextField(
+        blank=True, default="", help_text="Why the case received its status."
+    )
 
     class Meta:
         ordering = ["id"]
@@ -339,12 +359,19 @@ class RequestRecord(models.Model):
         TestCase, on_delete=models.CASCADE, related_name="request_records"
     )
     method = models.CharField(max_length=7, choices=HTTPMethod.choices)
-    url = models.URLField(max_length=2000, help_text="Fully resolved URL that was called.")
+    # A CharField for the same reason as TestRun.base_url: the URL that was
+    # called is evidence, and must be recorded even when Django would not
+    # consider it a valid URL.
+    url = models.CharField(max_length=2000, help_text="Fully resolved URL that was called.")
+    # Credentials are replaced with a placeholder before this is written.
     headers = models.JSONField(blank=True, default=dict)
     query_params = models.JSONField(blank=True, default=dict)
     path_params = models.JSONField(blank=True, default=dict)
     # None means no body was sent at all, which is distinct from an empty one.
     body = models.JSONField(null=True, blank=True, default=None)
+    # Set when no response was received: a timeout, a refused connection. Such
+    # a request has no ResponseRecord.
+    error = models.TextField(blank=True, default="", help_text="Why no response was received.")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -370,7 +397,8 @@ class ResponseRecord(models.Model):
         ]
     )
     headers = models.JSONField(blank=True, default=dict)
-    # None covers an empty body and a body that was not valid JSON.
+    # Parsed JSON when the body was JSON; otherwise its text, as a string, cut
+    # to a bounded length. None means the body was empty.
     body = models.JSONField(null=True, blank=True, default=None)
     response_time_ms = models.PositiveIntegerField(help_text="Wall-clock latency in milliseconds.")
     created_at = models.DateTimeField(auto_now_add=True)
