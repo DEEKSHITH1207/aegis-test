@@ -83,6 +83,23 @@ scenarios:
 """
 
 
+def test_a_setup_value_named_like_a_credential_is_secret_by_default() -> None:
+    rules = load(
+        _minimal(
+            head="""version: 1
+setup:
+  admin_password: {}
+  API_Key: {}
+  refresh_token: {}
+  client_secret: {}
+  keyboard_id: {secret: false}
+  employee_id: {}"""
+        )
+    )
+
+    assert rules.secret_names == {"admin_password", "API_Key", "refresh_token", "client_secret"}
+
+
 def _errors(text: str) -> list[str]:
     with pytest.raises(RulesFileError) as excinfo:
         load(text)

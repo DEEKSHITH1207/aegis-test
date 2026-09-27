@@ -133,7 +133,7 @@ def test_a_wrong_total_breaks_the_rule_with_both_values() -> None:
     assert after_approve.passed is False
     assert after_approve.actual == 55  # 15 days × 4 - 5
     assert after_approve.expected == 47
-    assert after_approve.detail == "actual 55 should be equals expected 47"
+    assert after_approve.detail == "expected 47, got 55"
     assert after_raise.passed is False and after_raise.actual == 70
     assert result.scenarios[0].status == "failed"
     # The chain ends with the follow-up GET whose answer was wrong.
@@ -346,10 +346,24 @@ def test_compare(actual, expected, how, holds) -> None:
 
 
 def test_compare_with_tolerance() -> None:
-    assert compare(47.004, 47, "equals", 0.01) == (True, "actual 47.004 is within 0.01 of expected 47")
-    holds, detail = compare(47.5, 47, "equals", 0.01)
-    assert holds is False
-    assert "by 0.5, more than the tolerance 0.01" in detail
+    assert compare(47.004, 47, "equals", 0.01) == (True, "expected 47 (± 0.01), got 47.004")
+    assert compare(47.5, 47, "equals", 0.01) == (False, "expected 47 (± 0.01), got 47.5")
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected", "how", "detail"),
+    [
+        (55, 47, "equals", "expected 47, got 55"),
+        (47, 47, "not_equals", "expected anything but 47, got 47"),
+        (6, 5, "less_than", "expected less than 5, got 6"),
+        (6, 5, "less_or_equal", "expected at most 5, got 6"),
+        (4, 5, "greater_than", "expected more than 5, got 4"),
+        (-1, 0, "greater_or_equal", "expected at least 0, got -1"),
+        ("2026-09-22", date(2026, 9, 23), "equals", "expected '2026-09-23', got '2026-09-22'"),
+    ],
+)
+def test_a_broken_rule_reads_expected_then_got(actual, expected, how, detail) -> None:
+    assert compare(actual, expected, how) == (False, detail)
 
 
 def test_values_that_cannot_be_ordered_are_unchecked() -> None:

@@ -88,6 +88,8 @@ class SetupValue:
     name: str
     # The environment variable the command reads it from.
     env: str
+    # Scrubbed from every recorded request and response. Defaults to true for
+    # a name containing password, token, secret or key.
     secret: bool = False
     description: str = ""
 
@@ -331,7 +333,10 @@ class _Parser:
             if not isinstance(env, str) or not _NAME.match(env):
                 self.error(f"{where}.env", f"{env!r} is not a valid environment variable name.")
                 continue
-            secret = options.get("secret", False)
+            # A credential whose flag was forgotten must not leak into the
+            # evidence, so the name decides when the file does not. An
+            # explicit `secret: false` still wins, for a name like `keyboard_id`.
+            secret = options.get("secret", _looks_secret(name))
             if not isinstance(secret, bool):
                 self.error(f"{where}.secret", "must be true or false.")
                 continue
@@ -713,6 +718,15 @@ class _Parser:
         for key in raw:
             if key not in allowed:
                 self.error(where, f"unknown key '{key}'. Expected one of: {', '.join(sorted(allowed))}.")
+
+
+# Setup names treated as secret unless the file says `secret: false`.
+_SECRET_NAME_MARKERS = ("password", "token", "secret", "key")
+
+
+def _looks_secret(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _SECRET_NAME_MARKERS)
 
 
 def _is_timezone(name: str) -> bool:

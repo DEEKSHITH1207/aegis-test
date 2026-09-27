@@ -436,16 +436,11 @@ def compare(
     """
     left, right = to_json(actual), to_json(expected)
     symbol = COMPARISONS[how]
-    words = how.replace("_", " ")
 
     if how == "equals" and tolerance is not None and _is_number(left) and _is_number(right):
         holds = abs(left - right) <= tolerance
-        return holds, (
-            f"actual {_show(left)} is within {_show(tolerance)} of expected {_show(right)}"
-            if holds
-            else f"actual {_show(left)} differs from expected {_show(right)} by "
-            f"{_show(abs(left - right))}, more than the tolerance {_show(tolerance)}"
-        )
+        expectation = f"{_show(right)} (± {_show(tolerance)})"
+        return holds, f"expected {expectation}, got {_show(left)}"
 
     try:
         holds = {
@@ -457,11 +452,23 @@ def compare(
             ">=": lambda: left >= right,
         }[symbol]()
     except TypeError:
-        return None, f"actual {_show(left)} and expected {_show(right)} cannot be compared ({words})"
+        return None, (
+            f"expected {_EXPECTATIONS[how]}{_show(right)}, got {_show(left)}, "
+            f"which cannot be compared with it"
+        )
+    return holds, f"expected {_EXPECTATIONS[how]}{_show(right)}, got {_show(left)}"
 
-    if holds:
-        return True, f"actual {_show(left)} {symbol} expected {_show(right)}"
-    return False, f"actual {_show(left)} should be {words} expected {_show(right)}"
+
+# How each comparison reads before the expected value: "expected 47, got 55",
+# "expected at least 0, got -1".
+_EXPECTATIONS = {
+    "equals": "",
+    "not_equals": "anything but ",
+    "less_than": "less than ",
+    "less_or_equal": "at most ",
+    "greater_than": "more than ",
+    "greater_or_equal": "at least ",
+}
 
 
 # --- Sending ------------------------------------------------------------------
