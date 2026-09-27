@@ -203,3 +203,7 @@ def test_the_working_lists_variables_in_the_order_they_appear() -> None:
     evaluation = _evaluator(zeta=1, alpha=2, mid=3).evaluate("zeta + alpha + mid + zeta")
 
     assert evaluation.working == "zeta = 1; alpha = 2; mid = 3; zeta + alpha + mid + zeta = 7"
+
+
+def test_a_lone_variable_is_not_repeated_in_the_working() -> None:
+    assert _evaluator(before=8).evaluate("before").working == "before = 8"

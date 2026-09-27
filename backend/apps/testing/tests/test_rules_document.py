@@ -398,3 +398,19 @@ def test_a_named_follow_up_cannot_reuse_a_variable_name() -> None:
     )
 
     assert any("'current' is already a variable" in error for error in errors)
+
+
+def test_a_comprehension_variable_is_not_an_undefined_name() -> None:
+    rules = load(
+        _minimal(
+            rules="""
+    rules:
+      - name: r
+        severity: low
+        why: The total is the sum of the parts.
+        actual: $.total
+        expected: sum([part['n'] for part in response['parts']])"""
+        )
+    )
+
+    assert rules.scenarios[0].rules[0].name == "r"

@@ -190,7 +190,10 @@ class Evaluator:
             if name in self.variables and not isinstance(self.variables[name], list):
                 parts.append(f"{name} = {_describe(self.variables[name])}")
         result = f"{_describe(value)}"
-        # "52 = 52" says nothing; show the expression only when it adds something.
+        # "52 = 52" says nothing, and neither does repeating a lone variable
+        # already listed; show the expression only when it adds something.
+        if source in self.variables and parts and parts[-1] == f"{source} = {result}":
+            return "; ".join(parts)
         if source != result:
             result = f"{source} = {result}"
         parts.append(result)
@@ -363,11 +366,21 @@ def _referenced_names(source: str) -> list[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
+    # A comprehension's loop variable (`driver` in `[d for driver in ...]`) is
+    # bound by the expression itself, not read from the file's variables.
+    bound = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
     names = sorted(
         (
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.Name) and node.id not in called and node.id != "today"
+            if isinstance(node, ast.Name)
+            and node.id not in called
+            and node.id not in bound
+            and node.id != "today"
         ),
         key=lambda node: (node.lineno, node.col_offset),
     )
