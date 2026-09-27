@@ -27,3 +27,6 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+# Real setup values for example rules files.
+examples/*.env
