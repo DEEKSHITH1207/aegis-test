@@ -16,6 +16,9 @@ from apps.testing import services
 from apps.testing.models import (
     Endpoint,
     Finding,
+    RuleExchange,
+    RulesRun,
+    ScenarioResult,
     Specification,
     TestCase,
     TestRun,
@@ -147,6 +150,7 @@ class FindingSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "test_case",
+            "scenario_result",
             "response_record",
             "title",
             "description",
@@ -219,3 +223,94 @@ class GenerationResultSerializer(serializers.Serializer):
     unchanged = serializers.IntegerField()
     skipped = serializers.IntegerField()
     warnings = serializers.ListField(child=serializers.CharField())
+
+
+class RulesRunCreateSerializer(serializers.Serializer):
+    """A request to run a business-rules file.
+
+    ``setup`` carries the values the file asks for — IDs, credentials. They
+    are handed to the run and never stored, so they are write-only and absent
+    from every response.
+    """
+
+    specification = serializers.PrimaryKeyRelatedField(queryset=Specification.objects.all())
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    base_url = serializers.CharField(max_length=2000)
+    rules = serializers.CharField(trim_whitespace=False)
+    setup = serializers.DictField(
+        child=serializers.CharField(allow_blank=True), required=False, default=dict
+    )
+    # Sets the dates the requests carry. It cannot move the server's clock.
+    today = serializers.DateField(required=False, allow_null=True, default=None)
+
+
+class RulesRunSerializer(serializers.ModelSerializer):
+    rules = serializers.CharField(source="rules_text", read_only=True)
+    results = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RulesRun
+        fields = [
+            "id",
+            "specification",
+            "name",
+            "base_url",
+            "rules",
+            "status",
+            "status_detail",
+            "today",
+            "today_overridden",
+            "warnings",
+            "results",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_results(self, rules_run: RulesRun) -> dict[str, int]:
+        return services.summarise_rules_run(rules_run)
+
+
+class ScenarioResultSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ScenarioResult
+        fields = [
+            "id",
+            "rules_run",
+            "position",
+            "name",
+            "status",
+            "steps_run",
+            "detail",
+            "checks",
+            "cleanup_problems",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class RuleExchangeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RuleExchange
+        fields = [
+            "id",
+            "rules_run",
+            "scenario_result",
+            "position",
+            "phase",
+            "name",
+            "method",
+            "url",
+            "request_headers",
+            "query_params",
+            "request_body",
+            "status_code",
+            "response_headers",
+            "response_body",
+            "response_time_ms",
+            "error",
+            "created_at",
+        ]
+        read_only_fields = fields

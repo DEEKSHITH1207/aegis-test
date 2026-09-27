@@ -99,14 +99,21 @@ class FakeLeaveApi:
     retroactive_rate: bool = False  # applies the current rate to every day accrued
     exclusive_days: bool = False  # counts a leave's days without its last day
     approve_status: int = 200
-    periods: list[Period] = field(
-        default_factory=lambda: [
-            Period(start=TODAY - timedelta(days=14), end=TODAY - timedelta(days=11), rate=2),
-            Period(start=TODAY - timedelta(days=10), end=None, rate=4),
-        ]
-    )
+    # Defaults to the same periods LEAVE_RULES describes, relative to `today`.
+    periods: list[Period] | None = None
     leaves: dict[int, dict] = field(default_factory=dict)
     requests: list[httpx.Request] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.periods is None:
+            self.periods = [
+                Period(
+                    start=self.today - timedelta(days=14),
+                    end=self.today - timedelta(days=11),
+                    rate=2,
+                ),
+                Period(start=self.today - timedelta(days=10), end=None, rate=4),
+            ]
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)

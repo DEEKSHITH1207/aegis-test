@@ -116,6 +116,18 @@ class FindingCategory(models.TextChoices):
     SCHEMA_MISMATCH = "schema_mismatch", "Schema mismatch"
     INCONSISTENCY = "inconsistency", "Inconsistency"
     PERFORMANCE = "performance", "Performance"
+    # A well-formed, successful response that holds a wrong value: a rule from
+    # a business-rules file did not hold.
+    BUSINESS_RULE_VIOLATION = "business_rule_violation", "Business rule violation"
+
+
+class ScenarioStatus(models.TextChoices):
+    """How one scenario of a business-rules run ended."""
+
+    PASSED = "passed", "Every rule held"
+    FAILED = "failed", "A rule was broken"
+    ERROR = "error", "A rule could not be checked"
+    STOPPED = "stopped", "A step failed and the scenario stopped"
 
 
 class FindingStatus(models.TextChoices):
@@ -419,15 +431,143 @@ class ResponseRecord(models.Model):
         return f"{self.status_code} in {self.response_time_ms}ms"
 
 
+class RulesRun(TimeStampedModel):
+    """One run of a business-rules file against an API.
+
+    The file's text is copied onto the run, so what a run checked cannot
+    change after the fact. Setup values — IDs, credentials — are deliberately
+    not stored: they are handed to the run when it starts and live only in
+    memory while it executes.
+    """
+
+    specification = models.ForeignKey(
+        Specification, on_delete=models.CASCADE, related_name="rules_runs"
+    )
+    name = models.CharField(max_length=255)
+    rules_text = models.TextField(help_text="The rules file as supplied (YAML, version 1).")
+    base_url = models.CharField(max_length=2000)
+    status = models.CharField(
+        max_length=16, choices=TestRunStatus.choices, default=TestRunStatus.PENDING
+    )
+    status_detail = models.TextField(blank=True, default="")
+    # The date "today" meant in the requests. Recorded because a rerun on
+    # another day sends different dates.
+    today = models.DateField(null=True, blank=True)
+    # True when the date came from --today. It changes the dates the requests
+    # carry, not the server's clock.
+    today_overridden = models.BooleanField(default=False)
+    warnings = models.JSONField(blank=True, default=list)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(completed_at__isnull=True)
+                | models.Q(started_at__isnull=False),
+                name="ck_rulesrun_completed_implies_started",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["specification", "-created_at"], name="idx_rulesrun_spec_created"),
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status in {
+            TestRunStatus.COMPLETED,
+            TestRunStatus.FAILED,
+            TestRunStatus.CANCELLED,
+        }
+
+
+class ScenarioResult(models.Model):
+    """What one scenario of a rules run did. Written once, when it finishes."""
+
+    rules_run = models.ForeignKey(RulesRun, on_delete=models.CASCADE, related_name="scenarios")
+    position = models.PositiveIntegerField()
+    name = models.CharField(max_length=255)
+    status = models.CharField(max_length=16, choices=ScenarioStatus.choices)
+    steps_run = models.PositiveIntegerField(default=0)
+    # Why the scenario stopped, when it did.
+    detail = models.TextField(blank=True, default="")
+    # Every rule check, passed or not: rule, after_step, outcome, expected,
+    # working, actual, detail. Findings are written for the broken ones.
+    checks = models.JSONField(blank=True, default=list)
+    cleanup_problems = models.JSONField(blank=True, default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["rules_run", "position"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rules_run", "position"], name="uniq_scenarioresult_position"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name}: {self.status}"
+
+
+class RuleExchange(models.Model):
+    """One request of a rules run and what came back. Immutable evidence.
+
+    Stored already scrubbed: the Authorization header, the login token and
+    every secret setup value are replaced before the row is written.
+    """
+
+    scenario_result = models.ForeignKey(
+        ScenarioResult, on_delete=models.CASCADE, related_name="exchanges", null=True, blank=True
+    )
+    # The login belongs to the run, not to a scenario.
+    rules_run = models.ForeignKey(RulesRun, on_delete=models.CASCADE, related_name="exchanges")
+    position = models.PositiveIntegerField()
+    phase = models.CharField(max_length=16)
+    name = models.CharField(max_length=255)
+    method = models.CharField(max_length=7, choices=HTTPMethod.choices)
+    url = models.CharField(max_length=2000)
+    request_headers = models.JSONField(blank=True, default=dict)
+    query_params = models.JSONField(blank=True, default=dict)
+    request_body = models.JSONField(null=True, blank=True, default=None)
+    # Null when no response arrived; ``error`` then says why.
+    status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    response_headers = models.JSONField(blank=True, default=dict)
+    response_body = models.JSONField(null=True, blank=True, default=None)
+    response_time_ms = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["rules_run", "position"]
+        indexes = [
+            models.Index(fields=["rules_run", "position"], name="idx_ruleexchange_run_position"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.method} {self.url} -> {self.status_code}"
+
+
 class Finding(TimeStampedModel):
     """A problem AegisTest believes it has observed, with the evidence for it.
+
+    A finding comes either from a generated test case or from a scenario of a
+    business-rules run — exactly one of the two, which a constraint enforces.
 
     ``response_record`` is optional and nulled rather than cascaded: a finding
     such as "the endpoint never responded" has no response to point at, and
     pruning old evidence should not erase the conclusion drawn from it.
     """
 
-    test_case = models.ForeignKey(TestCase, on_delete=models.CASCADE, related_name="findings")
+    test_case = models.ForeignKey(
+        TestCase, on_delete=models.CASCADE, related_name="findings", null=True, blank=True
+    )
+    scenario_result = models.ForeignKey(
+        ScenarioResult, on_delete=models.CASCADE, related_name="findings", null=True, blank=True
+    )
     response_record = models.ForeignKey(
         ResponseRecord,
         on_delete=models.SET_NULL,
@@ -454,8 +594,18 @@ class Finding(TimeStampedModel):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(test_case__isnull=False, scenario_result__isnull=True)
+                    | models.Q(test_case__isnull=True, scenario_result__isnull=False)
+                ),
+                name="ck_finding_exactly_one_source",
+            ),
+        ]
         indexes = [
             models.Index(fields=["test_case"], name="idx_finding_testcase"),
+            models.Index(fields=["scenario_result"], name="idx_finding_scenarioresult"),
             models.Index(fields=["severity", "status"], name="idx_finding_severity_status"),
         ]
 

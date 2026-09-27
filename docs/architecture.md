@@ -268,3 +268,44 @@ also a server-side request forgery surface. `EXECUTOR_ALLOWED_HOSTS` restricts
 the hosts a run may target and is checked when the run is created and again
 when it executes. Redirects are not followed, so an allowed host cannot bounce a
 request to one that is not.
+
+## Business rules
+
+```
+rules file ─ document.load ─→ RulesDocument   (pure: parsed, checked up front)
+                                   │
+            runner.run ── executor ──→ API     (network; persists nothing)
+                                   │
+                              RunResult
+                                   │
+       services._record_rules_result ──→ RulesRun, ScenarioResult,
+                                          RuleExchange, Finding
+```
+
+`apps/testing/rules/` holds four modules. `document`, `expressions` and
+`timeline` are pure. `runner` sends requests — through `executor`, so the
+same redirect, size and timeout rules apply — but writes nothing: it returns
+a `RunResult`, and the service records it in one transaction. The split keeps
+the runner testable with a mock transport and no database, and keeps the
+persistence rules in `services.py` with the rest.
+
+**Setup values are never persisted.** They enter through the command's
+environment or the API request, reach the worker as task arguments, and live
+in memory for the run. The runner scrubs secret ones, and the login token,
+from every exchange before returning it, so nothing the service writes can
+contain them. The file's text *is* stored on the run: what a run checked
+cannot change after the fact.
+
+**A rule that cannot be checked is not a rule that passed.** A missing field,
+a failed follow-up request or an expression error makes the check `unchecked`
+and the scenario `error`. Only a comparison that ran and failed is a
+`business_rule_violation`.
+
+**Findings have exactly one source.** `Finding.test_case` became nullable
+and `Finding.scenario_result` was added, with a check constraint that exactly
+one is set. Existing findings and `/test-runs/<id>/findings/` are unchanged.
+
+**Deterministic by construction.** `today` is fixed when the run starts and
+may be overridden; expression working lists variables in the order written,
+not in set order, so the same file and date give the same requests and the
+same finding text.

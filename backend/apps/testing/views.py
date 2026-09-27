@@ -14,12 +14,16 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.testing import services
-from apps.testing.models import Specification, TestRun
+from apps.testing.models import RulesRun, Specification, TestRun
 from apps.testing.serializers import (
     EndpointSerializer,
     FindingSerializer,
     GenerationResultSerializer,
     ImportResultSerializer,
+    RuleExchangeSerializer,
+    RulesRunCreateSerializer,
+    RulesRunSerializer,
+    ScenarioResultSerializer,
     SpecificationSerializer,
     TestCaseSerializer,
     TestRunSerializer,
@@ -139,3 +143,74 @@ class TestRunFindingListView(generics.ListAPIView):
     def get_queryset(self):
         test_run = get_object_or_404(TestRun, pk=self.kwargs["test_run_id"])
         return services.list_findings(test_run=test_run)
+
+
+class RulesRunListCreateView(generics.ListAPIView):
+    """GET a page of rules runs (?specification=<id> filters), or POST one.
+
+    POST returns 202: the run is checked, started and handed to a worker. The
+    ``setup`` values in the request reach the worker and are never stored.
+    """
+
+    serializer_class = RulesRunSerializer
+
+    def get_queryset(self):
+        specification = None
+        specification_id = self.request.query_params.get("specification")
+        if specification_id:
+            specification = get_object_or_404(Specification, pk=specification_id)
+        return services.list_rules_runs(specification=specification)
+
+    def post(self, request: Request) -> Response:
+        payload = RulesRunCreateSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+        rules_run = services.submit_rules_run(
+            specification=data["specification"],
+            rules_text=data["rules"],
+            base_url=data["base_url"],
+            setup_values=data["setup"],
+            name=data["name"],
+            today=data["today"],
+        )
+        rules_run = services.list_rules_runs().get(pk=rules_run.pk)
+        return Response(RulesRunSerializer(rules_run).data, status=status.HTTP_202_ACCEPTED)
+
+
+class RulesRunDetailView(generics.RetrieveAPIView):
+    serializer_class = RulesRunSerializer
+
+    def get_queryset(self):
+        return services.list_rules_runs()
+
+
+class _RulesRunChildListView(generics.ListAPIView):
+    def rules_run(self) -> RulesRun:
+        return get_object_or_404(RulesRun, pk=self.kwargs["rules_run_id"])
+
+
+class RulesRunScenarioListView(_RulesRunChildListView):
+    """Each scenario's outcome, with every rule check: expected, working, actual."""
+
+    serializer_class = ScenarioResultSerializer
+
+    def get_queryset(self):
+        return services.list_scenario_results(rules_run=self.rules_run())
+
+
+class RulesRunExchangeListView(_RulesRunChildListView):
+    """Every request the run made and what came back, in order, credentials removed."""
+
+    serializer_class = RuleExchangeSerializer
+
+    def get_queryset(self):
+        return services.list_rule_exchanges(rules_run=self.rules_run())
+
+
+class RulesRunFindingListView(_RulesRunChildListView):
+    """The run's findings, most severe first."""
+
+    serializer_class = FindingSerializer
+
+    def get_queryset(self):
+        return services.list_rules_findings(rules_run=self.rules_run())

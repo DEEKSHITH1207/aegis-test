@@ -10,7 +10,9 @@ over the collected evidence — never as the sole source of truth.
 **Status: Phase 5 — test execution.** AegisTest reads an OpenAPI 3.x or
 Swagger 2.0 document, turns it into endpoints, generates a deterministic suite of
 test cases from their schemas, sends each one to the API under test, and records
-what came back as evidence and findings. LLM analysis comes in a later phase.
+what came back as evidence and findings. A [business-rules file](#business-rules)
+adds multi-step scenarios that catch wrong values in otherwise successful
+responses. LLM analysis comes in a later phase.
 
 ## Architecture
 
@@ -132,6 +134,12 @@ database).
 | POST   | `/api/v1/test-runs/<id>/execute/`               | Send the run's requests (202, background)  |
 | GET    | `/api/v1/test-runs/<id>/test-cases/`            | Test cases; `?status=failed` filters       |
 | GET    | `/api/v1/test-runs/<id>/findings/`              | Findings produced by a run                 |
+| POST   | `/api/v1/rules-runs/`                           | Run a business-rules file (202)            |
+| GET    | `/api/v1/rules-runs/`                           | List rules runs; `?specification=<id>`     |
+| GET    | `/api/v1/rules-runs/<id>/`                      | One rules run, with result counts          |
+| GET    | `/api/v1/rules-runs/<id>/scenarios/`            | Scenarios and every rule check             |
+| GET    | `/api/v1/rules-runs/<id>/exchanges/`            | Every request/response, credentials removed|
+| GET    | `/api/v1/rules-runs/<id>/findings/`             | Broken rules, most severe first            |
 
 `/api/health/` is intentionally unversioned: it is an infrastructure probe, not
 part of the product contract.
@@ -409,3 +417,159 @@ only on your own machine.
   cancel or retry yet.
 - The same credentials are used for every case: there are no authentication or
   authorisation cases yet.
+
+## Business rules
+
+Generated tests catch what a schema forbids. They cannot catch a response that is
+`200`, well-formed, and holds the wrong number. A business-rules file describes
+what the numbers should be: scenarios of requests, and rules checked after them.
+
+```yaml
+version: 1
+timezone: Asia/Kolkata            # what "today" means
+
+setup:                            # supplied at run time, never stored
+  employee_id: {}                 # read from AEGIS_EMPLOYEE_ID
+  username: {}
+  password: {}                    # secret: the name contains "password"
+
+variables:
+  leave_start: ${today - 4d}
+
+timelines:                        # a quantity that changes over time
+  accrual:
+    - {from: today - 14d, to: today - 11d, rate: 2}
+    - {from: today - 10d, rate: 4}
+
+auth:                             # the token is sent on every later request
+  method: POST
+  path: /auth/login
+  body: {username: "${username}", password: "${password}"}
+  token: $.access_token
+
+scenarios:
+  - name: leave_balance
+    steps:
+      - name: apply
+        method: POST
+        path: /employees/{employee_id}/leaves
+        body: {start: "${leave_start}", end: "${today}"}
+        expect: 201
+        save: {leave_id: $.id}           # usable by later steps
+      - name: approve
+        method: POST
+        path: /leaves/{leave_id}/approve
+        expect: 200
+      - name: raise_rate
+        method: PUT
+        path: /employees/{employee_id}/accrual
+        body: {rate: 5}
+        expect: 200
+        timeline:
+          accrual: {from: today, rate: 5}  # closes the open period at today - 1d
+    rules:
+      - name: balance_is_accrual_minus_taken
+        severity: high
+        why: The balance must equal the leave accrued so far minus the leave taken.
+        after: [approve, raise_rate]       # omit to check after every step
+        fetch: {method: GET, path: "/employees/{employee_id}/balance"}
+        actual: $.balance                  # a JSON path, or an expression
+        expected: sum_over_periods(accrual) - days(leave_start, today)
+    cleanup:                               # always runs
+      - name: delete_leave
+        method: DELETE
+        path: /leaves/{leave_id}
+```
+
+When the API gets it wrong, the finding says what, why, and how the expected
+value was reached:
+
+```
+BROKEN [high] balance_is_accrual_minus_taken after approve
+  expected 47, got 55
+  expected worked out as: 4 days × 2 + 11 days × 4 = 52; leave_start = 2026-09-23;
+                          sum_over_periods(accrual) - days(leave_start, today) = 47
+```
+
+### Running one
+
+```bash
+python manage.py run_rules --specification 1 --rules rules.yaml \
+    --base-url http://localhost:3000 --env-file .env.rules [--today 2026-09-27]
+```
+
+Setup values come from the environment (`AEGIS_<NAME>`, or the `env:` the file
+names); `--env-file` adds a dotenv file that wins over the environment. The
+command prints every rule check and exits `1` when a rule is broken or a
+scenario stopped, so it can gate CI.
+
+Over the API, the values go in the request and are never stored:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/rules-runs/ -H 'Content-Type: application/json' \
+  -d '{"specification": 1, "base_url": "http://host.docker.internal:3000",
+       "rules": "<the YAML, as a string>",
+       "setup": {"employee_id": "42", "username": "asha", "password": "..."}}'
+```
+
+They reach the worker as task arguments through Redis, and exist only in
+memory while the run executes.
+
+### Expressions
+
+Expressions are evaluated by [simpleeval](https://pypi.org/project/simpleeval/),
+never `eval()`: arithmetic, comparisons, indexing, and only these names —
+
+| | |
+| --- | --- |
+| `today`, `today - 4d`, `today + 10d` | The run's date, in the file's time zone; day arithmetic |
+| `days(from, to)` | Days between two dates, both ends included |
+| `date("2026-01-31")` | A date from an ISO string |
+| `sum_over_periods(timeline)` | Σ days(from, to) × rate; an open period runs to today |
+| `response` | The last response body (or the rule's `fetch`) |
+| `abs min max round sum len int float str` | As in Python |
+
+In bodies, headers and queries, `${expr}` is replaced by its value; a string
+that is exactly one `${...}` keeps the value's type. Paths use `{name}`.
+
+Rules compare with `equals` (default, optionally with `tolerance`),
+`not_equals`, `less_than`, `less_or_equal`, `greater_than` or
+`greater_or_equal`.
+
+### What is reported
+
+| Outcome | Finding |
+| --- | --- |
+| A rule does not hold | **business_rule_violation**, at the rule's severity |
+| A step returns a status its `expect` does not allow | **inconsistency** (medium), or **bug** (high) for a 5xx; the scenario stops |
+| A rule cannot be checked (field missing, `fetch` failed) | none; the check is `unchecked` on the scenario |
+| The target cannot be reached | none; the scenario records why it stopped |
+
+Every finding carries the full request/response chain that led to it; the
+chain's entries point at stored exchanges (`/rules-runs/<id>/exchanges/`).
+
+### Credentials
+
+- Setup values are never stored as a field of a run.
+- Secret setup values, and the token the login returned, are scrubbed from every
+  stored request and response, including URL-encoded forms. A value is secret
+  when it says `secret: true`, or when its name contains `password`, `token`,
+  `secret` or `key` and it does not say `secret: false`.
+- Non-secret values, such as IDs, stay visible where the requests used them.
+- `Authorization` and other credential headers are redacted as for test runs.
+
+### `--today`
+
+The same file and the same `today` send the same requests. `--today` (or
+`today` in the API request) sets the date used for `today` in what AegisTest
+sends. **It does not move the server's clock**: anything the API computes from
+its own date still uses its real today, so a rule that depends on the server's
+idea of today can only be checked on that day.
+
+### Before a run starts
+
+The whole file is checked first, and every problem is reported at once with
+where it is: unknown keys, undefined variables (a step can only use values saved
+by earlier steps), bad JSON paths, expression syntax, unknown step names in
+`after`. A step whose request is not an operation of the specification is a
+warning, not an error.

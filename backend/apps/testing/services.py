@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 import httpx
@@ -27,14 +29,23 @@ from apps.testing import evaluation, executor, generator, openapi
 from apps.testing.models import (
     Endpoint,
     Finding,
+    FindingCategory,
+    FindingSeverity,
     RequestRecord,
     ResponseRecord,
+    RuleExchange,
+    RulesRun,
+    ScenarioResult,
+    ScenarioStatus,
     Specification,
     TestCase,
     TestCaseStatus,
     TestRun,
     TestRunStatus,
 )
+from apps.testing.rules import document as rules_document
+from apps.testing.rules import runner as rules_runner
+from apps.testing.rules.expressions import to_json
 
 logger = logging.getLogger(__name__)
 
@@ -659,11 +670,7 @@ def _evidence(
     result: executor.ExecutionResult,
 ) -> dict[str, Any]:
     """A finding's self-contained support: what was sent, and what came back."""
-    body = result.body
-    if body is not None:
-        rendered = body if isinstance(body, str) else json.dumps(body)
-        if len(rendered) > _EVIDENCE_BODY_MAX_CHARS:
-            body = rendered[:_EVIDENCE_BODY_MAX_CHARS] + " [truncated]"
+    body = _excerpt(result.body)
 
     return {
         "test_type": test_case.test_type,
@@ -681,6 +688,16 @@ def _evidence(
             "body": body,
         },
     }
+
+
+def _excerpt(body: Any) -> Any:
+    """A body as it appears in a finding: whole when small, cut when large."""
+    if body is None:
+        return None
+    rendered = body if isinstance(body, str) else json.dumps(body)
+    if len(rendered) > _EVIDENCE_BODY_MAX_CHARS:
+        return rendered[:_EVIDENCE_BODY_MAX_CHARS] + " [truncated]"
+    return body
 
 
 def _tally(summary: ExecutionSummary, test_case: TestCase) -> None:
@@ -720,3 +737,417 @@ def _fail_run(test_run: TestRun, detail: str) -> None:
 def list_findings(*, test_run: TestRun) -> models.QuerySet[Finding]:
     """Every finding produced by a run, across all of its cases."""
     return Finding.objects.filter(test_case__test_run=test_run).select_related("test_case")
+
+
+# --- Business-rules runs -------------------------------------------------------
+#
+# A rules run executes a business-rules file (see apps.testing.rules) against
+# an API. Setup values — IDs, credentials — are passed into these functions
+# and never stored: not on the run, not in the evidence (secret ones are
+# scrubbed by the runner), not in a finding.
+
+# Finding severities, most severe first, for ordering a report.
+_SEVERITY_RANK = {severity: rank for rank, severity in enumerate(FindingSeverity.values)}
+
+
+def load_rules(rules_text: str) -> rules_document.RulesDocument:
+    """Parse a rules file, reporting every problem against the ``rules`` field."""
+    try:
+        return rules_document.load(rules_text)
+    except rules_document.RulesFileError as exc:
+        raise ValidationError({"rules": exc.errors}) from exc
+
+
+@transaction.atomic
+def submit_rules_run(
+    *,
+    specification: Specification,
+    rules_text: str,
+    base_url: str,
+    setup_values: dict[str, str],
+    name: str = "",
+    today: date | None = None,
+    enqueue: bool = True,
+) -> RulesRun:
+    """Check a rules run can execute, create it, and start it.
+
+    Everything that can be refused is checked before anything is written —
+    the file, the base URL, the setup values — so a refused request leaves no
+    half-made run behind. ``enqueue=False`` starts the run without queueing
+    it, for a caller that executes it itself.
+    """
+    rules = load_rules(rules_text)
+
+    problem = executor.base_url_problem(base_url, settings.EXECUTOR_ALLOWED_HOSTS)
+    if problem:
+        raise ValidationError({"base_url": problem})
+    missing = rules_runner.missing_setup(rules, setup_values)
+    if missing:
+        raise ValidationError({"setup": _missing_setup_message(rules, missing)})
+
+    now = timezone.now()
+    rules_run = RulesRun(
+        specification=specification,
+        name=name.strip() or f"{specification.name} rules - {now:%Y-%m-%d %H:%M:%S}"[:255],
+        rules_text=rules_text,
+        base_url=base_url,
+        status=TestRunStatus.RUNNING,
+        today=today,
+        today_overridden=today is not None,
+        warnings=_rules_warnings(specification, rules),
+        started_at=now,
+    )
+    rules_run.full_clean()
+    rules_run.save()
+
+    if enqueue:
+        # Setup values travel to the worker as task arguments, through the
+        # broker, and are never written to the database.
+        values = dict(setup_values)
+        transaction.on_commit(lambda: _enqueue_rules_run(rules_run.pk, values))
+    return rules_run
+
+
+def _missing_setup_message(rules: rules_document.RulesDocument, missing: list[str]) -> str:
+    wanted = [value for value in rules.setup if value.name in missing]
+    return "Missing setup values: " + ", ".join(
+        f"{value.name} (env {value.env})" for value in wanted
+    )
+
+
+def _rules_warnings(
+    specification: Specification, rules: rules_document.RulesDocument
+) -> list[str]:
+    """Steps whose request is not an operation of the specification.
+
+    Only a warning: the file may exercise an endpoint the document forgot, and
+    placeholder names may differ ({id} against {userId}), so they are ignored.
+    """
+    known = {
+        (endpoint.method, _path_shape(endpoint.path))
+        for endpoint in specification.endpoints.all()
+    }
+    if not known:
+        return []
+    warnings: list[str] = []
+    for scenario in rules.scenarios:
+        for step in (*scenario.steps, *scenario.cleanup):
+            request = step.request
+            if (request.method, _path_shape(request.path)) not in known:
+                warnings.append(
+                    f"Scenario '{scenario.name}', step '{step.name}': {request.method} "
+                    f"{request.path} is not an operation of the specification."
+                )
+    return warnings
+
+
+def _path_shape(path: str) -> str:
+    return re.sub(r"\{[^{}]*\}", "{}", path.rstrip("/") or "/")
+
+
+def _enqueue_rules_run(rules_run_id: int, setup_values: dict[str, str]) -> None:
+    from apps.testing.tasks import run_rules_task
+
+    try:
+        run_rules_task.delay(rules_run_id, setup_values)
+    except Exception as exc:
+        logger.exception("Could not queue rules run %s", rules_run_id)
+        _fail_rules_run(
+            RulesRun.objects.get(pk=rules_run_id),
+            f"The run could not be queued for execution: {exc}",
+        )
+
+
+@dataclass
+class RulesRunSummary:
+    rules_run_id: int
+    scenarios: int = 0
+    checks: int = 0
+    broken: int = 0
+    unchecked: int = 0
+    stopped: int = 0
+    findings: int = 0
+
+
+def execute_rules_run(
+    *,
+    rules_run: RulesRun,
+    setup_values: dict[str, str],
+    client: httpx.Client | None = None,
+) -> RulesRunSummary:
+    """Run a started rules run's scenarios and record everything they did."""
+    if rules_run.status != TestRunStatus.RUNNING:
+        raise DomainError(
+            f"Only a running rules run can be executed; this one is '{rules_run.status}'."
+        )
+
+    summary = RulesRunSummary(rules_run_id=rules_run.pk)
+    owns_client = client is None
+    if client is None:
+        client = executor.make_client(
+            timeout=settings.EXECUTOR_TIMEOUT_SECONDS, verify_tls=settings.EXECUTOR_VERIFY_TLS
+        )
+    try:
+        problem = executor.base_url_problem(rules_run.base_url, settings.EXECUTOR_ALLOWED_HOSTS)
+        if problem:
+            _fail_rules_run(rules_run, problem)
+            return summary
+        try:
+            result = rules_runner.run(
+                rules_document.load(rules_run.rules_text),
+                base_url=rules_run.base_url,
+                setup_values=setup_values,
+                client=client,
+                max_response_bytes=settings.EXECUTOR_MAX_RESPONSE_BYTES,
+                today=rules_run.today if rules_run.today_overridden else None,
+            )
+        except (rules_document.RulesFileError, rules_runner.RunnerError) as exc:
+            _fail_rules_run(rules_run, str(exc))
+            return summary
+
+        with transaction.atomic():
+            _record_rules_result(rules_run, result, summary)
+            rules_run.today = result.today
+            if result.auth_error:
+                rules_run.status = TestRunStatus.FAILED
+                rules_run.status_detail = result.auth_error
+            else:
+                rules_run.status = TestRunStatus.COMPLETED
+            rules_run.completed_at = timezone.now()
+            rules_run.save(
+                update_fields=["today", "status", "status_detail", "completed_at", "updated_at"]
+            )
+    except Exception as exc:
+        _fail_rules_run(rules_run, f"Execution stopped unexpectedly: {exc}")
+        raise
+    finally:
+        if owns_client:
+            client.close()
+    return summary
+
+
+def _record_rules_result(
+    rules_run: RulesRun, result: rules_runner.RunResult, summary: RulesRunSummary
+) -> None:
+    """Write a finished run's scenarios, exchanges and findings."""
+    position = 0
+    stored: dict[int, RuleExchange] = {}
+
+    def store(exchange: rules_runner.Exchange, scenario: ScenarioResult | None) -> RuleExchange:
+        nonlocal position
+        if id(exchange) in stored:
+            return stored[id(exchange)]
+        position += 1
+        request, response = exchange.request, exchange.result
+        row = RuleExchange.objects.create(
+            rules_run=rules_run,
+            scenario_result=scenario,
+            position=position,
+            phase=exchange.phase,
+            name=exchange.name[:255],
+            method=request.method,
+            url=request.url[:2000],
+            request_headers=request.headers,
+            query_params=request.query_params,
+            request_body=request.body,
+            status_code=response.status_code,
+            response_headers=response.headers,
+            response_body=response.body,
+            response_time_ms=response.response_time_ms,
+            error=response.error,
+        )
+        stored[id(exchange)] = row
+        return row
+
+    if result.auth_exchange is not None:
+        store(result.auth_exchange, None)
+
+    for index, scenario in enumerate(result.scenarios):
+        row = ScenarioResult.objects.create(
+            rules_run=rules_run,
+            position=index,
+            name=scenario.name[:255],
+            status=scenario.status,
+            steps_run=scenario.steps_run,
+            detail=scenario.failure.detail if scenario.failure else "",
+            checks=[_check_record(outcome) for outcome in scenario.outcomes],
+            cleanup_problems=scenario.cleanup_problems,
+        )
+        for exchange in scenario.exchanges:
+            store(exchange, row)
+
+        summary.scenarios += 1
+        summary.checks += len(scenario.outcomes)
+        for outcome in scenario.outcomes:
+            if outcome.passed is None:
+                summary.unchecked += 1
+            elif outcome.passed is False:
+                summary.broken += 1
+                _rule_finding(row, outcome, result, [store(e, row) for e in outcome.chain])
+                summary.findings += 1
+        if scenario.failure is not None:
+            summary.stopped += 1
+            chain = [store(e, row) for e in scenario.failure.chain]
+            if _stop_finding(row, scenario.failure, chain):
+                summary.findings += 1
+
+
+def _check_record(outcome: rules_runner.RuleOutcome) -> dict[str, Any]:
+    return {
+        "rule": outcome.rule.name,
+        "severity": outcome.rule.severity,
+        "after_step": outcome.after_step,
+        "outcome": {True: "passed", False: "broken", None: "unchecked"}[outcome.passed],
+        "expected": to_json(outcome.expected),
+        "expected_working": outcome.expected_working,
+        "actual": to_json(outcome.actual),
+        "detail": outcome.detail,
+    }
+
+
+def _rule_finding(
+    scenario: ScenarioResult,
+    outcome: rules_runner.RuleOutcome,
+    result: rules_runner.RunResult,
+    chain: list[RuleExchange],
+) -> Finding:
+    rule = outcome.rule
+    return Finding.objects.create(
+        scenario_result=scenario,
+        title=f"{rule.name}: {outcome.detail}"[:255],
+        description=(
+            f"{rule.why}\n\nChecked after step '{outcome.after_step}' of scenario "
+            f"'{outcome.scenario}': {outcome.detail}. The expected value was worked out as: "
+            f"{outcome.expected_working}."
+        ),
+        severity=rule.severity,
+        category=FindingCategory.BUSINESS_RULE_VIOLATION,
+        evidence={
+            "rule": rule.name,
+            "why": rule.why,
+            "scenario": outcome.scenario,
+            "after_step": outcome.after_step,
+            "comparison": rule.compare,
+            "tolerance": rule.tolerance,
+            "expected": to_json(outcome.expected),
+            "expected_working": outcome.expected_working,
+            "actual": to_json(outcome.actual),
+            "detail": outcome.detail,
+            "today": result.today.isoformat(),
+            "today_overridden": result.today_overridden,
+            "chain": [_chain_entry(row) for row in chain],
+        },
+    )
+
+
+def _stop_finding(
+    scenario: ScenarioResult, failure: rules_runner.StepFailure, chain: list[RuleExchange]
+) -> Finding | None:
+    """A scenario that stopped on an unexpected status is a finding.
+
+    One that stopped because nothing answered — a refused connection, a
+    timeout — or because the file itself could not be evaluated is not a
+    claim about the API, and is reported on the scenario instead.
+    """
+    status = failure.status_code
+    if status is None or not failure.step:
+        return None
+    server_error = status >= 500
+    expected = " or ".join(str(code) for code in failure.expected_status) or "success"
+    return Finding.objects.create(
+        scenario_result=scenario,
+        title=(
+            f"Scenario '{failure.scenario}' stopped at step '{failure.step}': "
+            f"expected {expected}, got {status}"
+        )[:255],
+        description=(
+            f"{failure.detail} The steps after '{failure.step}', and the rules they "
+            f"would have checked, did not run."
+        ),
+        severity=FindingSeverity.HIGH if server_error else FindingSeverity.MEDIUM,
+        category=FindingCategory.BUG if server_error else FindingCategory.INCONSISTENCY,
+        evidence={
+            "scenario": failure.scenario,
+            "step": failure.step,
+            "expected_status": list(failure.expected_status),
+            "status_code": status,
+            "detail": failure.detail,
+            "chain": [_chain_entry(row) for row in chain],
+        },
+    )
+
+
+def _chain_entry(exchange: RuleExchange) -> dict[str, Any]:
+    return {
+        "exchange_id": exchange.pk,
+        "step": f"{exchange.phase} {exchange.name}",
+        "method": exchange.method,
+        "url": exchange.url,
+        "request_body": _excerpt(exchange.request_body),
+        "status_code": exchange.status_code,
+        "response_body": _excerpt(exchange.response_body),
+        "error": exchange.error,
+    }
+
+
+def _fail_rules_run(rules_run: RulesRun, detail: str) -> None:
+    rules_run.refresh_from_db()
+    if rules_run.is_finished:
+        return
+    now = timezone.now()
+    rules_run.status = TestRunStatus.FAILED
+    rules_run.status_detail = detail
+    rules_run.started_at = rules_run.started_at or now
+    rules_run.completed_at = now
+    rules_run.save(
+        update_fields=["status", "status_detail", "started_at", "completed_at", "updated_at"]
+    )
+
+
+def list_rules_runs(
+    *, specification: Specification | None = None
+) -> models.QuerySet[RulesRun]:
+    queryset = RulesRun.objects.select_related("specification").prefetch_related("scenarios")
+    if specification is not None:
+        queryset = queryset.filter(specification=specification)
+    return queryset.annotate(
+        findings_count=models.Count("scenarios__findings", distinct=True)
+    ).order_by(*RulesRun._meta.ordering)
+
+
+def summarise_rules_run(rules_run: RulesRun) -> dict[str, int]:
+    """Scenario and rule counts for a run, plus how many findings it produced."""
+    if not hasattr(rules_run, "findings_count"):
+        rules_run = list_rules_runs().get(pk=rules_run.pk)
+    scenarios = list(rules_run.scenarios.all())
+    summary = {"scenarios": len(scenarios)}
+    summary.update(
+        {status: sum(s.status == status for s in scenarios) for status in ScenarioStatus.values}
+    )
+    checks = [check for scenario in scenarios for check in scenario.checks]
+    summary["rules_checked"] = len(checks)
+    for outcome in ("passed", "broken", "unchecked"):
+        summary[f"rules_{outcome}"] = sum(check["outcome"] == outcome for check in checks)
+    summary["findings"] = rules_run.findings_count
+    return summary
+
+
+def list_scenario_results(*, rules_run: RulesRun) -> models.QuerySet[ScenarioResult]:
+    return rules_run.scenarios.all()
+
+
+def list_rule_exchanges(*, rules_run: RulesRun) -> models.QuerySet[RuleExchange]:
+    return rules_run.exchanges.all()
+
+
+def list_rules_findings(*, rules_run: RulesRun) -> models.QuerySet[Finding]:
+    """A run's findings, most severe first."""
+    rank = models.Case(
+        *(models.When(severity=severity, then=position) for severity, position in _SEVERITY_RANK.items()),
+        output_field=models.IntegerField(),
+    )
+    return (
+        Finding.objects.filter(scenario_result__rules_run=rules_run)
+        .select_related("scenario_result")
+        .order_by(rank, "id")
+    )
