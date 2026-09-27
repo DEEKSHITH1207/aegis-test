@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any
 
 from jsonpath_ng.exceptions import JsonPathLexerError, JsonPathParserError
@@ -86,10 +87,17 @@ def is_json_path(value: Any) -> bool:
     return isinstance(value, str) and value.strip().startswith("$")
 
 
+@lru_cache(maxsize=512)
+def _compiled(path: str) -> Any:
+    # jsonpath-ng builds a parser per call (~15 ms); a run reads the same few
+    # paths after every step.
+    return parse_json_path(path)
+
+
 def check_json_path(path: str) -> str:
     """Why ``path`` is not a usable JSONPath, or "" when it is."""
     try:
-        parse_json_path(path)
+        _compiled(path)
     except (JsonPathLexerError, JsonPathParserError, Exception) as exc:
         return f"'{path}' is not a valid JSON path ({exc})."
     return ""
@@ -105,7 +113,7 @@ def query(path: str, document: Any) -> Any:
     problem = check_json_path(path)
     if problem:
         raise ExpressionError(problem)
-    matches = [match.value for match in parse_json_path(path).find(document)]
+    matches = [match.value for match in _compiled(path).find(document)]
     if not matches:
         raise ExpressionError(f"Nothing in the response matches {path}.")
     return matches[0] if len(matches) == 1 else matches
