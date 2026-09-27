@@ -401,3 +401,12 @@ def test_the_command_lists_every_problem_in_a_bad_file(leave_spec, tmp_path) -> 
 
     assert "version: must be 1" in str(excinfo.value)
     assert "scenarios: must be a non-empty list" in str(excinfo.value)
+
+
+def test_a_specification_prefixed_with_the_base_path_still_matches(leave_spec) -> None:
+    # The document lists /api/employees/...; the base URL already ends in /api.
+    leave_spec.endpoints.create(path="/api/employees/{employeeId}/leaves", method="POST")
+
+    rules_run, _ = _run(leave_spec, FakeLeaveApi())
+
+    assert not any("step 'apply'" in warning for warning in rules_run.warnings)

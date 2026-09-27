@@ -66,44 +66,52 @@ def days_delta(count: int) -> timedelta:
 
 
 def append_period(periods: list[Period], start: Any, rate: Any) -> list[Period]:
-    """Return ``periods`` with a new open period from ``start``.
+    """Return ``periods`` with the rate changed from ``start`` on.
 
-    The period still open, if any, is closed the day before ``start``, which is
-    how a rate change reads in a rules file: "from today, the rate is 4".
+    This is how a rate change reads in a rules file — "from today, the rate is
+    4". The period ``start`` falls in is split: the part before keeps the old
+    rate and ends the day before, the part from ``start`` gets the new rate
+    and keeps the period's end, so a schedule's end date survives the change.
+    A change on a period's first day re-rates the whole period; one after the
+    last period has ended opens a new period.
     """
     begin = as_date(start)
+    new_rate = _rate(rate)
     result = list(periods)
-    if result and result[-1].end is None:
-        previous = result[-1]
-        close = begin - timedelta(days=1)
-        if close < previous.start:
-            raise TimelineError(
-                f"A new period from {begin} would close the open one, which started "
-                f"on {previous.start}, before it began."
-            )
-        result[-1] = Period(start=previous.start, end=close, rate=previous.rate)
-    elif result and result[-1].end is not None and begin <= result[-1].end:
+    if not result:
+        return [Period(start=begin, end=None, rate=new_rate)]
+
+    previous = result[-1]
+    if begin < previous.start:
         raise TimelineError(
-            f"A new period from {begin} overlaps the last one, which ends {result[-1].end}."
+            f"A rate change from {begin} falls before the last period, which began "
+            f"on {previous.start}, before it began."
         )
-    result.append(Period(start=begin, end=None, rate=_rate(rate)))
+    if begin == previous.start:
+        result[-1] = Period(start=previous.start, end=previous.end, rate=new_rate)
+    elif previous.end is None or begin <= previous.end:
+        result[-1] = Period(start=previous.start, end=begin - timedelta(days=1), rate=previous.rate)
+        result.append(Period(start=begin, end=previous.end, rate=new_rate))
+    else:
+        result.append(Period(start=begin, end=None, rate=new_rate))
     return result
 
 
 def sum_over_periods(periods: list[Period], until: Any) -> tuple[int | float | Decimal, str]:
     """Sum of days(start, end) × rate over every period, with the working.
 
-    An open period runs to ``until`` — the run's "today" — inclusive. A period
-    that starts after ``until`` has not begun and contributes nothing.
+    A period with an end counts in full, future days included: a schedule's
+    total is fixed by its dates, not by how many of them have passed. A period
+    with no end runs to ``until`` — the run's "today" — inclusive, and one that
+    starts after ``until`` has not begun and contributes nothing.
     """
     limit = as_date(until)
     total: int | float | Decimal = 0
     terms: list[str] = []
     for period in periods:
-        if period.start > limit:
+        if period.end is None and period.start > limit:
             continue
-        end = min(period.closed_at(limit), limit)
-        count = days(period.start, end)
+        count = days(period.start, period.closed_at(limit))
         total += count * period.rate
         terms.append(f"{count} {'day' if count == 1 else 'days'} × {_number(period.rate)}")
 

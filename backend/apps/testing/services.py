@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from django.conf import settings
@@ -794,7 +795,7 @@ def submit_rules_run(
         status=TestRunStatus.RUNNING,
         today=today,
         today_overridden=today is not None,
-        warnings=_rules_warnings(specification, rules),
+        warnings=_rules_warnings(specification, rules, base_url),
         started_at=now,
     )
     rules_run.full_clean()
@@ -816,17 +817,21 @@ def _missing_setup_message(rules: rules_document.RulesDocument, missing: list[st
 
 
 def _rules_warnings(
-    specification: Specification, rules: rules_document.RulesDocument
+    specification: Specification, rules: rules_document.RulesDocument, base_url: str
 ) -> list[str]:
     """Steps whose request is not an operation of the specification.
 
     Only a warning: the file may exercise an endpoint the document forgot, and
     placeholder names may differ ({id} against {userId}), so they are ignored.
+    A document whose paths include the base URL's own prefix (/sklc/users with
+    a base URL ending in /sklc) is matched without it.
     """
-    known = {
-        (endpoint.method, _path_shape(endpoint.path))
-        for endpoint in specification.endpoints.all()
-    }
+    prefix = urlsplit(base_url).path.rstrip("/")
+    known: set[tuple[str, str]] = set()
+    for endpoint in specification.endpoints.all():
+        known.add((endpoint.method, _path_shape(endpoint.path)))
+        if prefix and endpoint.path.startswith(prefix + "/"):
+            known.add((endpoint.method, _path_shape(endpoint.path[len(prefix) :])))
     if not known:
         return []
     warnings: list[str] = []

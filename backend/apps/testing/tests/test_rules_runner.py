@@ -371,3 +371,28 @@ def test_values_that_cannot_be_ordered_are_unchecked() -> None:
 
     assert holds is None
     assert "cannot be compared" in detail
+
+
+# --- Named follow-up requests -------------------------------------------------
+
+
+def test_named_follow_ups_are_each_sent_recorded_and_readable() -> None:
+    rules = LEAVE_RULES.replace(
+        """        fetch: {method: GET, path: "/employees/{employee_id}/balance"}
+        actual: $.balance
+        expected: sum_over_periods(accrual) - days(leave_start, today)""",
+        """        fetch:
+          before: {method: GET, path: "/employees/{employee_id}/balance"}
+          again: {method: GET, path: "/employees/{employee_id}/balance"}
+        actual: jsonpath(again, '$.balance')
+        expected: jsonpath(before, '$.balance')""",
+    )
+
+    result = _run(FakeLeaveApi(), rules)
+
+    after_approve = _outcomes(result, "balance_is_accrual_minus_taken")[0]
+    assert after_approve.passed is True
+    assert [e.label for e in after_approve.chain][-2:] == [
+        "fetch balance_is_accrual_minus_taken",
+        "fetch balance_is_accrual_minus_taken",
+    ]

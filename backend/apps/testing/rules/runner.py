@@ -357,9 +357,9 @@ def _check_rule(
             chain=tuple(chain),
         )
 
-    if rule.fetch is not None:
+    for fetch_name, spec in rule.fetches:
         try:
-            fetched = _send(rule.fetch, scope, context, phase="fetch", name=rule.name)
+            fetched = _send(spec, scope, context, phase="fetch", name=rule.name)
         except ExpressionError as exc:
             return result(None, f"The follow-up request could not be built: {exc}")
         # A follow-up is a real request to the API: it belongs to the
@@ -371,10 +371,10 @@ def _check_rule(
         if status is None or not 200 <= status < 300:
             return result(
                 None,
-                f"The follow-up {rule.fetch.method} {rule.fetch.path} failed: "
+                f"The follow-up {spec.method} {spec.path} failed: "
                 f"{fetched.result.error or f'status {status}'}.",
             )
-        scope.set("response", fetched.result.body)
+        scope.set(fetch_name, fetched.result.body)
 
     try:
         expected = scope.evaluate(rule.expected)

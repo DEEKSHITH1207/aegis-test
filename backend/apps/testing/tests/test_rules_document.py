@@ -155,7 +155,8 @@ def test_rules_know_when_they_apply() -> None:
     inclusive, balance, never_negative = scenario.rules
 
     assert inclusive.applies_after("apply") and not inclusive.applies_after("approve")
-    assert balance.fetch.path == "/employees/{employee_id}/balance"
+    ((fetch_name, fetch),) = balance.fetches
+    assert (fetch_name, fetch.path) == ("response", "/employees/{employee_id}/balance")
     assert balance.tolerance == 0.01
     assert never_negative.after == (EVERY_STEP,)
     assert all(never_negative.applies_after(step.name) for step in scenario.steps)
@@ -358,3 +359,42 @@ def test_an_oversized_file_is_refused() -> None:
     errors = _errors("#" * (document.MAX_DOCUMENT_BYTES + 1))
 
     assert "larger than" in errors[0]
+
+
+def test_a_rule_can_make_several_named_follow_up_requests() -> None:
+    rules = load(
+        _minimal(
+            rules="""
+    rules:
+      - name: history_matches
+        severity: medium
+        why: The newest history row matches the record.
+        fetch:
+          history: {method: GET, path: /things/history}
+          current: {method: GET, path: /things/current}
+        actual: jsonpath(history, '$.data[0].total')
+        expected: jsonpath(current, '$.data.total')"""
+        )
+    )
+
+    (rule,) = rules.scenarios[0].rules
+    assert [name for name, _ in rule.fetches] == ["history", "current"]
+
+
+def test_a_named_follow_up_cannot_reuse_a_variable_name() -> None:
+    errors = _errors(
+        _minimal(
+            head="version: 1\nvariables:\n  current: 1",
+            rules="""
+    rules:
+      - name: r
+        severity: low
+        why: because
+        fetch:
+          current: {method: GET, path: /x}
+        actual: jsonpath(current, '$.a')
+        expected: 1""",
+        )
+    )
+
+    assert any("'current' is already a variable" in error for error in errors)

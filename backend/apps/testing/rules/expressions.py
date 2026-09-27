@@ -69,6 +69,15 @@ _FUNCTIONS: dict[str, Any] = {
     "str": str,
 }
 
+def _jsonpath(document: Any, path: str) -> Any:
+    """``jsonpath(history, '$.data[0].next.totalTrips')`` in an expression."""
+    if not isinstance(path, str):
+        raise ExpressionError("jsonpath() takes a response and a JSON path string.")
+    return query(path, document)
+
+
+_FUNCTIONS["jsonpath"] = _jsonpath
+
 # Names a rules file may not define, because an expression would then be
 # unable to reach the built-in of the same name.
 RESERVED_NAMES = frozenset({"today", "sum_over_periods", "response", *_FUNCTIONS})

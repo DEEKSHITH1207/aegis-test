@@ -149,8 +149,10 @@ class Rule:
     compare: str = "equals"
     # For numbers compared with `equals`: how far apart still counts as equal.
     tolerance: float | None = None
-    # A request made just for this rule; `actual` then reads its response.
-    fetch: RequestSpec | None = None
+    # Requests made just for this rule, each bound to a name its expressions
+    # can read. A single unnamed `fetch` is bound to `response`, so a JSON-path
+    # `actual` reads it.
+    fetches: tuple[tuple[str, RequestSpec], ...] = ()
 
     def applies_after(self, step_name: str) -> bool:
         return EVERY_STEP in self.after or step_name in self.after
@@ -622,15 +624,11 @@ class _Parser:
                 self.error(f"{where}.after", f"'{step}' is not a step of this scenario.")
                 ok = False
 
-        fetch = None
-        if raw.get("fetch") is not None:
-            if not isinstance(raw["fetch"], dict):
-                self.error(f"{where}.fetch", "must be a request mapping with method and path.")
-                ok = False
-            else:
-                self.unknown_keys(raw["fetch"], {"method", "path", "query", "headers"}, f"{where}.fetch")
-                fetch = self.request(raw["fetch"], f"{where}.fetch", known)
-                ok = ok and fetch is not None
+        fetches = self.fetches(raw.get("fetch"), f"{where}.fetch", known)
+        if fetches is None:
+            ok = False
+            fetches = ()
+        readable = {*known, "response", *(fetch_name for fetch_name, _ in fetches)}
 
         actual = raw.get("actual")
         if not isinstance(actual, str) or not actual.strip():
@@ -639,13 +637,13 @@ class _Parser:
         elif expressions.is_json_path(actual):
             ok = self.json_path(actual, f"{where}.actual") and ok
         else:
-            ok = self.expression(actual, f"{where}.actual", {*known, "response"}) and ok
+            ok = self.expression(actual, f"{where}.actual", readable) and ok
 
         if "expected" not in raw:
             self.error(f"{where}.expected", "is required.")
             ok = False
         elif isinstance(raw["expected"], str):
-            ok = self.expression(raw["expected"], f"{where}.expected", {*known, "response"}) and ok
+            ok = self.expression(raw["expected"], f"{where}.expected", readable) and ok
 
         compare = raw.get("compare", "equals")
         if compare not in COMPARISONS:
@@ -672,8 +670,51 @@ class _Parser:
             expected=raw["expected"],
             compare=compare,
             tolerance=float(tolerance) if tolerance is not None else None,
-            fetch=fetch,
+            fetches=fetches,
         )
+
+    def fetches(
+        self, raw: Any, where: str, known: set[str]
+    ) -> tuple[tuple[str, RequestSpec], ...] | None:
+        """A rule's follow-up requests, or None when they are unusable.
+
+        Either one request ({method, path, ...}), read as `response`, or a
+        mapping of names to requests, each read by its name:
+        ``{history: {method: GET, ...}, schedule: {method: GET, ...}}``.
+        """
+        if raw is None:
+            return ()
+        request_keys = {"method", "path", "query", "headers"}
+        if not isinstance(raw, dict) or not raw:
+            self.error(where, "must be a request ({method, path}) or a mapping of names to requests.")
+            return None
+        if "method" in raw or "path" in raw:
+            self.unknown_keys(raw, request_keys, where)
+            spec = self.request(raw, where, known)
+            return None if spec is None else (("response", spec),)
+
+        fetches: list[tuple[str, RequestSpec]] = []
+        ok = True
+        for fetch_name, request in raw.items():
+            at = f"{where}.{fetch_name}"
+            if not self.name(fetch_name, at):
+                ok = False
+                continue
+            if fetch_name in known:
+                self.error(at, f"'{fetch_name}' is already a variable; name the request differently.")
+                ok = False
+                continue
+            if not isinstance(request, dict):
+                self.error(at, "must be a request mapping with method and path.")
+                ok = False
+                continue
+            self.unknown_keys(request, request_keys, at)
+            spec = self.request(request, at, known)
+            if spec is None:
+                ok = False
+            else:
+                fetches.append((fetch_name, spec))
+        return tuple(fetches) if ok else None
 
     # --- Shared checks ----------------------------------------------------------
 
