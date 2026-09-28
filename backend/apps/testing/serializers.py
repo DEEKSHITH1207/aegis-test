@@ -79,6 +79,7 @@ class EndpointSerializer(serializers.ModelSerializer):
             "parameters",
             "request_schema",
             "response_schema",
+            "tags",
             "created_at",
             "updated_at",
         ]
@@ -98,6 +99,15 @@ class TestRunSerializer(serializers.ModelSerializer):
     header_names = serializers.SerializerMethodField()
     results = serializers.SerializerMethodField()
     specification_name = serializers.CharField(source="specification.name", read_only=True)
+    # Limit the run to part of the API: endpoint IDs, and/or tags (sections)
+    # whose endpoints are all included. Neither means every endpoint.
+    endpoints = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Endpoint.objects.all(), required=False
+    )
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=100), required=False, write_only=True
+    )
+    scope = serializers.SerializerMethodField()
 
     class Meta:
         model = TestRun
@@ -109,6 +119,9 @@ class TestRunSerializer(serializers.ModelSerializer):
             "base_url",
             "headers",
             "header_names",
+            "endpoints",
+            "tags",
+            "scope",
             "status",
             "status_detail",
             "results",
@@ -132,6 +145,9 @@ class TestRunSerializer(serializers.ModelSerializer):
 
     def get_results(self, test_run: TestRun) -> dict[str, int]:
         return services.summarise_test_run(test_run)
+
+    def get_scope(self, test_run: TestRun) -> dict[str, Any]:
+        return services.describe_scope(test_run)
 
 
 class TestCaseSerializer(serializers.ModelSerializer):

@@ -1,17 +1,20 @@
-import { useMemo } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useMemo, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { api } from "../api";
 import AnalysisPanel from "../components/AnalysisPanel";
 import FindingsList from "../components/FindingsList";
-import { ErrorAlert, Loading, StatusBadge, Tile, formatDate } from "../components/ui";
-import { useLoad } from "../hooks";
+import { ErrorAlert, Loading, Spinner, StatusBadge, Tile, formatDate, scopeText } from "../components/ui";
+import { describe, useLoad } from "../hooks";
 import type { Assessment } from "../types";
 
 const POLL_MS = 2000;
 
 export default function RunPage() {
   const id = Number(useParams().id);
+  const navigate = useNavigate();
+  const [rerunning, setRerunning] = useState(false);
+  const [rerunError, setRerunError] = useState<string | null>(null);
   const run = useLoad(() => api.run(id), [id], {
     pollMs: POLL_MS,
     shouldPoll: (r) => r?.status === "running" || r?.status === "pending",
@@ -42,6 +45,19 @@ export default function RunPage() {
   const done = r.results.total - r.results.pending - r.results.running;
   const percent = r.results.total ? Math.round((done / r.results.total) * 100) : 0;
 
+  async function rerun() {
+    setRerunning(true);
+    setRerunError(null);
+    try {
+      const next = await api.rerun(r.id);
+      navigate(`/runs/${next.id}`);
+    } catch (err) {
+      setRerunError(describe(err));
+    } finally {
+      setRerunning(false);
+    }
+  }
+
   return (
     <div className="stack">
       <div className="page-header">
@@ -55,8 +71,21 @@ export default function RunPage() {
             <StatusBadge status={r.status} /> <code>{r.base_url}</code>
             {r.header_names.length > 0 && <span> - headers: {r.header_names.join(", ")}</span>}
           </p>
+          <p>
+            <strong>Scope:</strong> {scopeText(r.scope)}
+          </p>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="btn"
+            onClick={rerun}
+            disabled={!finished || rerunning}
+            title="Test the same endpoints again, with the same target and headers"
+          >
+            {rerunning && <Spinner label="Starting" />}
+            Run again
+          </button>
           <a
             className="btn"
             href={api.reportUrl(r.id, true)}
@@ -85,6 +114,7 @@ export default function RunPage() {
           </div>
         </div>
       )}
+      <ErrorAlert message={rerunError} />
       {r.status === "failed" && r.status_detail && <div className="alert">{r.status_detail}</div>}
 
       <div className="tiles">

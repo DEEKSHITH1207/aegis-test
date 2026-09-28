@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-import type { RunStatus, Severity, Verdict } from "../types";
+import type { RunScope, RunStatus, Severity, Verdict } from "../types";
 
 const STATUS_LABELS: Record<RunStatus, string> = {
   pending: "Pending",
@@ -78,4 +78,14 @@ export function formatDate(value: string | null | undefined): string {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+/** "All 374 endpoints", or "12 of 374 endpoints - Fleet, Citizen". */
+export function scopeText(scope: RunScope | undefined): string {
+  if (!scope) return "";
+  if (scope.all) return `All ${scope.total} endpoints`;
+  const base = `${scope.endpoints} of ${scope.total} endpoints`;
+  if (!scope.tags.length) return base;
+  const shown = scope.tags.slice(0, 3).join(", ");
+  return `${base} - ${shown}${scope.tags.length > 3 ? ` +${scope.tags.length - 3} more` : ""}`;
 }

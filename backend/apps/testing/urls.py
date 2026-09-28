@@ -96,4 +96,9 @@ urlpatterns = [
         name="test-run-report",
     ),
     path("features/", views.FeaturesView.as_view(), name="features"),
+    path(
+        "test-runs/<int:test_run_id>/rerun/",
+        views.TestRunRerunView.as_view(),
+        name="test-run-rerun",
+    ),
 ]

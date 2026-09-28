@@ -132,7 +132,10 @@ export const api = {
     name: string;
     base_url: string;
     headers: Record<string, string>;
+    /** Only these endpoints; omit or leave empty to test every endpoint. */
+    endpoints?: number[];
   }) => post<TestRun>("/test-runs/", body),
+  rerun: (id: number) => post<TestRun>(`/test-runs/${id}/rerun/`),
   generate: (id: number) => post<GenerationResult>(`/test-runs/${id}/generate-tests/`),
   execute: (id: number) => post<TestRun>(`/test-runs/${id}/execute/`),
   findings: (id: number) => all<Finding>(`/test-runs/${id}/findings/`),

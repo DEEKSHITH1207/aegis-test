@@ -48,6 +48,14 @@ export interface Endpoint {
   method: string;
   summary: string;
   operation_id: string;
+  tags: string[];
+}
+
+export interface RunScope {
+  all: boolean;
+  endpoints: number;
+  total: number;
+  tags: string[];
 }
 
 export interface RunResults {
@@ -68,6 +76,8 @@ export interface TestRun {
   name: string;
   base_url: string;
   header_names: string[];
+  endpoints: number[];
+  scope: RunScope;
   status: RunStatus;
   status_detail: string;
   results: RunResults;

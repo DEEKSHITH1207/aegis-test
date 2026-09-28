@@ -115,8 +115,10 @@ creates and drops a separate `test_aegis` database on every run.
    drop. It is stored and its endpoints imported in one step.
 2. **Starts a test run** from the API's page: the base URL is prefilled from
    the document's `servers` (or `host` + `basePath`), and headers such as
-   `Authorization` can be added. One click generates the cases and starts
-   execution.
+   `Authorization` can be added. It tests everything, or only the sections
+   (Swagger tags) and endpoints picked — see [Testing part of an
+   API](#testing-part-of-an-api). One click generates the cases and starts
+   execution; **Run again** on a finished run repeats it.
 3. **Watches it run**: progress, results and findings fill in live. Each
    finding opens to show the request, the response and, once analysed, the AI
    assessment.
@@ -139,6 +141,36 @@ The dev server forwards `/api` to Django (`VITE_API_PROXY`, default
 `http://localhost:8000`), so the browser talks to one origin and the backend
 needs no CORS setup. Without a Celery worker, set `CELERY_TASK_ALWAYS_EAGER=True`
 so a run executes inside the request that starts it.
+
+### Testing part of an API
+
+A large document is rarely tested whole every time. A run can be limited to
+some of its endpoints:
+
+- **By section.** Swagger `tags` are stored on each endpoint at import. In the
+  dashboard, choose *Choose sections or endpoints*, tick a section to take all
+  of its endpoints, or open it and tick single endpoints; search filters by
+  path, method, summary or section.
+- **Over the API**, pass `tags`, `endpoints` (IDs) or both when creating the
+  run; the run tests their union. An unknown tag is a 400 that lists the tags
+  the API has.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/test-runs/ -H 'Content-Type: application/json' \
+  -d '{"specification": 2, "base_url": "http://localhost:4000/sklc", "tags": ["Fleet", "Citizen"]}'
+```
+
+A run with no selection tests every endpoint. Each run reports its `scope`
+(`{"all": false, "endpoints": 25, "total": 374, "tags": ["Fleet"]}`), and the
+PDF states it on the cover.
+
+`POST /test-runs/<id>/rerun/` — **Run again** in the dashboard — creates a new
+run with the same endpoints, base URL and headers, generates its cases and
+starts it. The headers are copied on the server, so a token does not have to
+be typed in again.
+
+Specifications imported before tags were stored had them filled in by
+migration `0006` from the stored document; re-importing one does the same.
 
 ### The PDF report
 
@@ -180,7 +212,8 @@ database).
 | GET    | `/api/v1/specifications/<id>/`                  | Retrieve one specification                 |
 | GET    | `/api/v1/specifications/<id>/endpoints/`        | Endpoints of a specification               |
 | POST   | `/api/v1/specifications/<id>/import/`           | Parse the document into endpoints          |
-| POST   | `/api/v1/test-runs/`                            | Open a test run (starts `pending`)         |
+| POST   | `/api/v1/test-runs/`                            | Open a test run; `endpoints`/`tags` limit it |
+| POST   | `/api/v1/test-runs/<id>/rerun/`                 | Same scope, target and headers again (202) |
 | GET    | `/api/v1/test-runs/`                            | List runs; `?specification=<id>` filters   |
 | GET    | `/api/v1/test-runs/<id>/`                       | Retrieve one run                           |
 | POST   | `/api/v1/test-runs/<id>/generate-tests/`        | Generate the run's test cases              |

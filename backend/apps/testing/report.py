@@ -128,6 +128,8 @@ class RunReport:
     findings: list[ReportFinding] = field(default_factory=list)
     findings_total: int = 0
     analysis: ReportAnalysis | None = None
+    # What part of the API the run tested, e.g. "All 40 endpoints".
+    scope: str = ""
 
 
 def render(report: RunReport) -> bytes:
@@ -179,6 +181,7 @@ def _cover(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
         ("Specification", report.specification),
         ("Test run", f"{report.run_name} (#{report.run_id})"),
         ("Target", report.base_url or "-"),
+        ("Scope", report.scope or "-"),
         ("Status", report.status.capitalize()),
         ("Started", _when(report.started_at)),
         ("Completed", _when(report.completed_at)),

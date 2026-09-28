@@ -225,6 +225,9 @@ class Endpoint(TimeStampedModel):
     # different from having one with no properties.
     request_schema = models.JSONField(null=True, blank=True, default=None)
     response_schema = models.JSONField(null=True, blank=True, default=None)
+    # The document's tags for the operation: the sections a user picks from
+    # when a run should test only part of an API.
+    tags = models.JSONField(blank=True, default=list)
 
     class Meta:
         ordering = ["path", "method"]
@@ -271,6 +274,9 @@ class TestRun(TimeStampedModel):
     status_detail = models.TextField(
         blank=True, default="", help_text="Why the run ended as it did, when that needs saying."
     )
+    # The endpoints this run tests. Empty means every endpoint of the
+    # specification, including ones imported after the run was created.
+    endpoints = models.ManyToManyField(Endpoint, blank=True, related_name="selected_in_runs")
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 

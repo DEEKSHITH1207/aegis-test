@@ -333,3 +333,17 @@ class FeaturesView(APIView):
                 "llm_model": settings.LLM_MODEL if settings.LLM_ANALYSIS_ENABLED else "",
             }
         )
+
+
+class TestRunRerunView(APIView):
+    """Test the same endpoints of the same API again, with the same headers.
+
+    Creates a new run, generates its cases and starts it. Returns 202 with the
+    new run; the old one is left as it was.
+    """
+
+    def post(self, request: Request, test_run_id: int) -> Response:
+        test_run = get_object_or_404(TestRun, pk=test_run_id)
+        rerun = services.rerun_test_run(test_run=test_run)
+        rerun = services.list_test_runs().get(pk=rerun.pk)
+        return Response(TestRunSerializer(rerun).data, status=status.HTTP_202_ACCEPTED)

@@ -118,6 +118,7 @@ class ImportResult:
 # The Endpoint fields an import owns. Anything outside this list is left alone,
 # so a re-import never clobbers data the parser does not produce.
 _IMPORTED_ENDPOINT_FIELDS = (
+    "tags",
     "operation_id",
     "summary",
     "description",
@@ -304,13 +305,26 @@ def upload_specification(
 # --- Test runs ----------------------------------------------------------------
 
 
-def create_test_run(*, specification: Specification, name: str = "", **fields: Any) -> TestRun:
+@transaction.atomic
+def create_test_run(
+    *,
+    specification: Specification,
+    name: str = "",
+    endpoints: list[Endpoint] | None = None,
+    tags: list[str] | None = None,
+    **fields: Any,
+) -> TestRun:
     """Open a new run in the PENDING state.
 
     A run is always created pending: nothing has executed yet at the moment the
     caller asks for one. Naming it is a convenience, not information the caller
     must supply, so an omitted name is derived from the specification.
+
+    ``endpoints`` and ``tags`` limit the run to part of the API: the endpoints
+    named, plus every endpoint filed under one of the tags. With neither, the
+    run tests every endpoint.
     """
+    selected = _select_endpoints(specification, endpoints or [], tags or [])
     test_run = TestRun(
         specification=specification,
         name=name.strip() or _default_test_run_name(specification),
@@ -320,7 +334,78 @@ def create_test_run(*, specification: Specification, name: str = "", **fields: A
     test_run.full_clean()
     _validate_target(test_run)
     test_run.save()
+    if selected:
+        test_run.endpoints.set(selected)
     return test_run
+
+
+def _select_endpoints(
+    specification: Specification, endpoints: list[Endpoint], tags: list[str]
+) -> list[Endpoint]:
+    """The endpoints a selection names, checked against the specification."""
+    foreign = [e for e in endpoints if e.specification_id != specification.pk]
+    if foreign:
+        raise ValidationError(
+            {
+                "endpoints": "These endpoints belong to another specification: "
+                + ", ".join(str(e.pk) for e in foreign)
+                + "."
+            }
+        )
+    selected = {e.pk: e for e in endpoints}
+    unknown: list[str] = []
+    for tag in dict.fromkeys(t.strip() for t in tags if t.strip()):
+        tagged = list(specification.endpoints.filter(tags__contains=[tag]))
+        if not tagged:
+            unknown.append(tag)
+        selected.update((e.pk, e) for e in tagged)
+    if unknown:
+        known = sorted({t for e in specification.endpoints.all() for t in e.tags})
+        raise ValidationError(
+            {
+                "tags": f"No endpoint is tagged {', '.join(repr(t) for t in unknown)}. "
+                + (f"Tags in this API: {', '.join(known)}." if known else "This API uses no tags.")
+            }
+        )
+    return list(selected.values())
+
+
+def run_endpoints(test_run: TestRun) -> models.QuerySet[Endpoint]:
+    """The endpoints a run tests: its selection, or every one of its API's."""
+    if test_run.endpoints.exists():
+        return test_run.endpoints.all()
+    return test_run.specification.endpoints.all()
+
+
+def describe_scope(test_run: TestRun) -> dict[str, Any]:
+    """What part of the API a run covers, for display."""
+    selected = list(test_run.endpoints.all())
+    total = getattr(test_run, "specification_endpoint_count", None)
+    if total is None:
+        total = test_run.specification.endpoints.count()
+    if not selected:
+        return {"all": True, "endpoints": total, "total": total, "tags": []}
+    tags = sorted({tag for endpoint in selected for tag in endpoint.tags})
+    return {"all": False, "endpoints": len(selected), "total": total, "tags": tags}
+
+
+@transaction.atomic
+def rerun_test_run(*, test_run: TestRun, enqueue: bool = True) -> TestRun:
+    """Test the same part of the same API again, with the same headers.
+
+    A new run — a run executes once — copying the target, the headers and the
+    endpoint selection, with its cases generated and its execution started.
+    The headers are copied on the server, so credentials never have to be
+    typed in again.
+    """
+    rerun = create_test_run(
+        specification=test_run.specification,
+        base_url=test_run.base_url,
+        headers=dict(test_run.headers) if isinstance(test_run.headers, dict) else {},
+        endpoints=list(test_run.endpoints.all()),
+    )
+    generate_test_cases_for_run(test_run=rerun)
+    return start_execution(test_run=rerun, enqueue=enqueue)
 
 
 def _validate_target(test_run: TestRun) -> None:
@@ -365,7 +450,15 @@ def list_test_runs(*, specification: Specification | None = None) -> models.Quer
     # Django drops Meta.ordering from an aggregating query, so it is restated.
     queryset = (
         TestRun.objects.select_related("specification")
+        .prefetch_related("endpoints")
         .annotate(
+            specification_endpoint_count=models.Subquery(
+                Endpoint.objects.filter(specification=models.OuterRef("specification"))
+                .order_by()
+                .values("specification")
+                .annotate(count=models.Count("id"))
+                .values("count")
+            ),
             total_count=models.Count("test_cases", distinct=True),
             findings_count=models.Count("test_cases__findings", distinct=True),
             **_RESULT_COUNTS,
@@ -494,7 +587,7 @@ def generate_test_cases_for_run(*, test_run: TestRun) -> GenerationResult:
         for case in test_run.test_cases.all()
     }
 
-    for endpoint in test_run.specification.endpoints.all():
+    for endpoint in run_endpoints(test_run):
         result.endpoints += 1
 
         expected = generator.ExpectedStatus.from_codes(
@@ -1658,7 +1751,17 @@ def test_run_report(*, test_run: TestRun) -> report.RunReport:
         findings=[_report_finding(f, assessments.get(f.pk)) for f in findings],
         findings_total=findings_total,
         analysis=_report_analysis(analysis) if analysis is not None else None,
+        scope=_scope_text(describe_scope(test_run)),
     )
+
+
+def _scope_text(scope: dict[str, Any]) -> str:
+    if scope["all"]:
+        return f"All {scope['total']} endpoints"
+    text = f"{scope['endpoints']} of {scope['total']} endpoints"
+    if scope["tags"]:
+        text += " - sections: " + ", ".join(scope["tags"])
+    return text
 
 
 def _local(moment):

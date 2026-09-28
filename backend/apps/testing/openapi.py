@@ -62,6 +62,8 @@ class ParsedOperation:
     parameters: list[dict[str, Any]] = field(default_factory=list)
     request_schema: dict[str, Any] | None = None
     response_schema: dict[str, Any] | None = None
+    # The sections the document files the operation under, in its order.
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -351,7 +353,24 @@ def _parse_operation(
         parameters=parameters,
         request_schema=_request_schema(operation, parameters, document, source_type, warnings),
         response_schema=_response_schema(operation, document, source_type, warnings),
+        tags=operation_tags(operation),
     )
+
+
+# A tag is a section name; anything longer is not one worth showing whole.
+_TAG_MAX_LENGTH = 100
+
+
+def operation_tags(operation: Any) -> list[str]:
+    """An operation's tags: non-empty strings, trimmed, each once, in order."""
+    raw = operation.get("tags") if isinstance(operation, dict) else None
+    if not isinstance(raw, list):
+        return []
+    tags: list[str] = []
+    for tag in raw:
+        if isinstance(tag, str) and tag.strip() and tag.strip()[:_TAG_MAX_LENGTH] not in tags:
+            tags.append(tag.strip()[:_TAG_MAX_LENGTH])
+    return tags
 
 
 def _merge_parameters(shared: list[Any], own: Any) -> list[dict[str, Any]]:

@@ -1,7 +1,7 @@
 import { Link, useNavigate } from "react-router-dom";
 
 import { api } from "../api";
-import { ErrorAlert, Loading, StatusBadge, Tile, formatDate } from "../components/ui";
+import { ErrorAlert, Loading, StatusBadge, Tile, formatDate, scopeText } from "../components/ui";
 import { useLoad } from "../hooks";
 
 export default function DashboardPage() {
@@ -70,6 +70,9 @@ export default function DashboardPage() {
                       <Link to={`/runs/${run.id}`} onClick={(e) => e.stopPropagation()}>
                         {run.name}
                       </Link>
+                      <div className="muted" style={{ fontSize: "0.8rem" }}>
+                        {scopeText(run.scope)}
+                      </div>
                     </td>
                     <td>{run.specification_name}</td>
                     <td>
