@@ -20,13 +20,14 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+import yaml
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
 
 from apps.core.exceptions import DomainError
-from apps.testing import evaluation, executor, generator, openapi
+from apps.testing import evaluation, executor, generator, openapi, report
 from apps.testing.analysis import prompts as analysis_prompts
 from apps.testing.analysis.client import Analyst, AnalystError
 from apps.testing.models import (
@@ -70,7 +71,9 @@ def create_specification(**fields: Any) -> Specification:
 
 
 def list_specifications() -> models.QuerySet[Specification]:
-    return Specification.objects.all()
+    return Specification.objects.annotate(
+        endpoint_count=models.Count("endpoints", distinct=True)
+    ).order_by(*Specification._meta.ordering)
 
 
 def list_endpoints(*, specification: Specification) -> models.QuerySet[Endpoint]:
@@ -213,6 +216,89 @@ def _sync_source_type(specification: Specification, source_type: str) -> None:
     if source_type and specification.source_type != source_type:
         specification.source_type = source_type
         specification.save(update_fields=["source_type", "updated_at"])
+
+
+# --- Uploading a specification file -------------------------------------------
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that refuses anchors and aliases.
+
+    A few kilobytes of nested aliases expand into gigabytes once the document
+    is copied into a JSON column. No real API description needs them.
+    """
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None, "YAML aliases (*name) are not supported", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+
+def decode_specification_file(content: bytes) -> dict[str, Any]:
+    """Turn an uploaded JSON or YAML file into a document, or explain why not."""
+    if len(content) > settings.SPEC_UPLOAD_MAX_BYTES:
+        raise ValidationError(
+            {"file": f"The file is larger than {settings.SPEC_UPLOAD_MAX_BYTES} bytes."}
+        )
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValidationError({"file": "The file is not UTF-8 text."}) from exc
+
+    try:
+        document = json.loads(text)
+    except ValueError:
+        try:
+            document = yaml.load(text, Loader=_NoAliasLoader)  # noqa: S506 - safe loader
+        except yaml.YAMLError as exc:
+            raise ValidationError(
+                {"file": f"The file is neither valid JSON nor valid YAML: {exc}"}
+            ) from exc
+
+    if not isinstance(document, dict):
+        raise ValidationError({"file": "The file does not hold an OpenAPI or Swagger document."})
+    # YAML can hold values JSON cannot, such as dates; store them as text.
+    return json.loads(json.dumps(document, default=str))
+
+
+@transaction.atomic
+def upload_specification(
+    *, content: bytes, filename: str = "", name: str = "", version: str = ""
+) -> tuple[Specification, ImportResult]:
+    """Create a specification from an uploaded file and import its endpoints.
+
+    One transaction: a document that cannot be imported leaves no
+    specification behind. Name and version default to the document's
+    ``info.title`` and ``info.version``.
+    """
+    document = decode_specification_file(content)
+    info = document.get("info") if isinstance(document.get("info"), dict) else {}
+    stem = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    name = (name.strip() or str(info.get("title") or "").strip() or stem or "Uploaded API")[:255]
+    version = (version.strip() or str(info.get("version") or "").strip())[:64]
+    description = info.get("description")
+
+    if Specification.objects.filter(name=name, version=version).exists():
+        raise ValidationError(
+            {
+                "name": f"A specification named '{name}' at version '{version or '(none)'}' "
+                f"already exists. Give this upload another name or version."
+            }
+        )
+    specification = create_specification(
+        name=name,
+        version=version,
+        description=description if isinstance(description, str) else "",
+        raw_specification=document,
+    )
+    try:
+        result = import_endpoints(specification=specification)
+    except ValidationError as exc:
+        raise ValidationError({"file": exc.message_dict.get("raw_specification", exc.messages)}) from exc
+    return specification, result
 
 
 # --- Test runs ----------------------------------------------------------------
@@ -1525,4 +1611,146 @@ def _severity_rank(field_name: str) -> models.Case:
             for severity, position in _SEVERITY_RANK.items()
         ),
         output_field=models.IntegerField(),
+    )
+
+
+# --- PDF report -----------------------------------------------------------------
+
+# Findings printed in a report, most severe first. Every finding stays
+# available from the API; a PDF of thousands of pages helps nobody.
+_REPORT_MAX_FINDINGS = 300
+
+
+def test_run_report_pdf(*, test_run: TestRun) -> bytes:
+    """A test run's findings, endpoint results and latest AI analysis, as a PDF."""
+    return report.render(test_run_report(test_run=test_run))
+
+
+def test_run_report(*, test_run: TestRun) -> report.RunReport:
+    test_run = list_test_runs().get(pk=test_run.pk)
+    all_findings = (
+        Finding.objects.filter(test_case__test_run=test_run)
+        .select_related("test_case__endpoint", "response_record")
+        .order_by(_severity_rank("severity"), "id")
+    )
+    findings_total = all_findings.count()
+    findings = list(all_findings[:_REPORT_MAX_FINDINGS])
+
+    analysis = (
+        list_analyses(test_run=test_run).filter(status=TestRunStatus.COMPLETED).first()
+    )
+    assessments: dict[int, FindingAssessment] = {}
+    if analysis is not None:
+        assessments = {a.finding_id: a for a in analysis.assessments.all()}
+
+    return report.RunReport(
+        specification=str(test_run.specification),
+        run_name=test_run.name,
+        run_id=test_run.pk,
+        base_url=test_run.base_url,
+        status=test_run.status,
+        status_detail=test_run.status_detail,
+        started_at=_local(test_run.started_at),
+        completed_at=_local(test_run.completed_at),
+        generated_at=_local(timezone.now()),
+        results=summarise_test_run(test_run),
+        endpoints=_report_endpoints(test_run),
+        findings=[_report_finding(f, assessments.get(f.pk)) for f in findings],
+        findings_total=findings_total,
+        analysis=_report_analysis(analysis) if analysis is not None else None,
+    )
+
+
+def _local(moment):
+    return timezone.localtime(moment) if moment else None
+
+
+def _report_endpoints(test_run: TestRun) -> list[report.ReportEndpoint]:
+    def count(status: str) -> models.Count:
+        return models.Count(
+            "test_cases",
+            filter=models.Q(test_cases__test_run=test_run, test_cases__status=status),
+            distinct=True,
+        )
+
+    endpoints = (
+        test_run.specification.endpoints.filter(test_cases__test_run=test_run)
+        .annotate(
+            cases=models.Count(
+                "test_cases", filter=models.Q(test_cases__test_run=test_run), distinct=True
+            ),
+            passed=count(TestCaseStatus.PASSED),
+            failed=count(TestCaseStatus.FAILED),
+            errors=count(TestCaseStatus.ERROR),
+            findings=models.Count(
+                "test_cases__findings",
+                filter=models.Q(test_cases__test_run=test_run),
+                distinct=True,
+            ),
+        )
+        .distinct()
+        .order_by("path", "method")
+    )
+    return [
+        report.ReportEndpoint(
+            label=f"{e.method} {e.path}",
+            cases=e.cases,
+            passed=e.passed,
+            failed=e.failed,
+            errors=e.errors,
+            findings=e.findings,
+        )
+        for e in endpoints
+    ]
+
+
+def _report_finding(
+    finding: Finding, assessment: FindingAssessment | None
+) -> report.ReportFinding:
+    test_case = finding.test_case
+    endpoint = test_case.endpoint
+    evidence = finding.evidence if isinstance(finding.evidence, dict) else {}
+    request = evidence.get("request") if isinstance(evidence.get("request"), dict) else {}
+    response = evidence.get("response") if isinstance(evidence.get("response"), dict) else {}
+    return report.ReportFinding(
+        id=finding.pk,
+        title=finding.title,
+        severity=finding.severity,
+        category=finding.category,
+        description=finding.description,
+        endpoint=f"{endpoint.method} {endpoint.path}",
+        test_case=test_case.name,
+        test_type=test_case.test_type,
+        expected_status=test_case.expected_status_code,
+        request_method=str(request.get("method") or ""),
+        request_url=str(request.get("url") or ""),
+        request_body=request.get("body"),
+        response_status=response.get("status_code"),
+        response_body=response.get("body"),
+        response_time_ms=response.get("response_time_ms"),
+        assessment=(
+            report.ReportAssessment(
+                verdict=assessment.verdict,
+                confidence=assessment.confidence,
+                suggested_severity=assessment.suggested_severity,
+                reasoning=assessment.reasoning,
+                likely_cause=assessment.likely_cause,
+                recommendation=assessment.recommendation,
+            )
+            if assessment is not None
+            else None
+        ),
+    )
+
+
+def _report_analysis(analysis: Analysis) -> report.ReportAnalysis:
+    counts = summarise_analysis(analysis)
+    return report.ReportAnalysis(
+        model=", ".join(analysis.usage.get("models") or []) or analysis.model,
+        completed_at=_local(analysis.completed_at),
+        summary=analysis.summary,
+        groups=analysis.groups,
+        verdicts={verdict: counts[verdict] for verdict in AssessmentVerdict.values},
+        findings_total=analysis.findings_total,
+        findings_selected=analysis.findings_selected,
     )

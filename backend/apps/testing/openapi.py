@@ -114,6 +114,35 @@ def parse(document: Any) -> ParsedDocument:
     )
 
 
+def suggested_base_url(document: Any) -> str:
+    """Where the document says its API is served, or "" when it does not say.
+
+    OpenAPI 3 lists ``servers``; Swagger 2 splits the URL into ``schemes``,
+    ``host`` and ``basePath``. A relative server URL or one with template
+    variables (``https://{region}.example.com``) cannot be used as it stands,
+    so it is not suggested.
+    """
+    if not isinstance(document, dict):
+        return ""
+    servers = document.get("servers")
+    if isinstance(servers, list) and servers:
+        first = servers[0]
+        url = first.get("url") if isinstance(first, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")) and "{" not in url:
+            return url.rstrip("/")
+        return ""
+    host = document.get("host")
+    if isinstance(host, str) and host and "{" not in host:
+        schemes = document.get("schemes")
+        scheme = "https"
+        if isinstance(schemes, list) and schemes and "https" not in schemes:
+            scheme = str(schemes[0])
+        base_path = document.get("basePath")
+        base_path = base_path if isinstance(base_path, str) else ""
+        return f"{scheme}://{host}{base_path}".rstrip("/")
+    return ""
+
+
 def documented_status_codes(document: Any, path: str, method: str) -> list[str]:
     """The response codes a document declares for one operation.
 

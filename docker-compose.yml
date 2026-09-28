@@ -67,5 +67,22 @@ services:
       redis:
         condition: service_healthy
 
+  # The dashboard: Vite's dev server, forwarding /api to the backend.
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm ci && npx vite --host 0.0.0.0 --port 5173 --strictPort"
+    environment:
+      VITE_API_PROXY: http://backend:8000
+    volumes:
+      - ./frontend:/app
+      # node_modules stays in the container: the host's may be built for
+      # another platform.
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:

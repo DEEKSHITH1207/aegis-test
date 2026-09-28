@@ -12,7 +12,7 @@ from typing import Any
 
 from rest_framework import serializers
 
-from apps.testing import services
+from apps.testing import openapi, services
 from apps.testing.models import (
     Analysis,
     Endpoint,
@@ -28,6 +28,11 @@ from apps.testing.models import (
 
 
 class SpecificationSerializer(serializers.ModelSerializer):
+    endpoint_count = serializers.SerializerMethodField()
+    # Where the document says the API is served; a starting point for a run's
+    # base URL, never used without the user seeing it.
+    suggested_base_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Specification
         fields = [
@@ -37,10 +42,20 @@ class SpecificationSerializer(serializers.ModelSerializer):
             "source_type",
             "raw_specification",
             "version",
+            "endpoint_count",
+            "suggested_base_url",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_endpoint_count(self, specification: Specification) -> int:
+        if hasattr(specification, "endpoint_count"):
+            return specification.endpoint_count
+        return specification.endpoints.count()
+
+    def get_suggested_base_url(self, specification: Specification) -> str:
+        return openapi.suggested_base_url(specification.raw_specification)
 
     def validate_name(self, value: str) -> str:
         # A name of spaces passes CharField's blank check but is not a name.
@@ -82,12 +97,14 @@ class TestRunSerializer(serializers.ModelSerializer):
     )
     header_names = serializers.SerializerMethodField()
     results = serializers.SerializerMethodField()
+    specification_name = serializers.CharField(source="specification.name", read_only=True)
 
     class Meta:
         model = TestRun
         fields = [
             "id",
             "specification",
+            "specification_name",
             "name",
             "base_url",
             "headers",
@@ -374,3 +391,12 @@ class FindingAssessmentSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = fields
+
+
+class SpecificationUploadSerializer(serializers.Serializer):
+    """An OpenAPI or Swagger file, JSON or YAML. Name and version default to
+    the document's info.title and info.version."""
+
+    file = serializers.FileField()
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    version = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")

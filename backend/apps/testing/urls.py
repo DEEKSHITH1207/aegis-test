@@ -15,6 +15,11 @@ urlpatterns = [
         name="specification-list",
     ),
     path(
+        "specifications/upload/",
+        views.SpecificationUploadView.as_view(),
+        name="specification-upload",
+    ),
+    path(
         "specifications/<int:pk>/",
         views.SpecificationDetailView.as_view(),
         name="specification-detail",
@@ -85,4 +90,10 @@ urlpatterns = [
         views.AnalysisAssessmentListView.as_view(),
         name="analysis-assessment-list",
     ),
+    path(
+        "test-runs/<int:test_run_id>/report.pdf",
+        views.TestRunReportView.as_view(),
+        name="test-run-report",
+    ),
+    path("features/", views.FeaturesView.as_view(), name="features"),
 ]

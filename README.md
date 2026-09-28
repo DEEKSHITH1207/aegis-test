@@ -19,7 +19,7 @@ to do next — without ever changing a finding itself.
 ## Architecture
 
 ```
-React frontend (later)
+React dashboard (frontend/)
         |
         v
   Django REST API  ----> PostgreSQL <----+
@@ -107,6 +107,56 @@ sudo -u postgres createdb --owner aegis aegis
 `--createdb` is required for the test suite, not for the application: pytest
 creates and drops a separate `test_aegis` database on every run.
 
+## Dashboard
+
+`frontend/` is a React + TypeScript app (Vite). From it a user:
+
+1. **Uploads** a Swagger 2.0 or OpenAPI 3.x file, JSON or YAML, by drag and
+   drop. It is stored and its endpoints imported in one step.
+2. **Starts a test run** from the API's page: the base URL is prefilled from
+   the document's `servers` (or `host` + `basePath`), and headers such as
+   `Authorization` can be added. One click generates the cases and starts
+   execution.
+3. **Watches it run**: progress, results and findings fill in live. Each
+   finding opens to show the request, the response and, once analysed, the AI
+   assessment.
+4. **Asks for AI analysis** (when the server has it turned on).
+5. **Downloads the PDF report**, or opens it in the browser.
+
+```bash
+# With docker compose: http://localhost:5173
+docker compose up
+
+# On the host, with Django on :8000
+cd frontend
+npm install
+npm run dev          # http://localhost:5173, /api forwarded to :8000
+npm test             # vitest
+npm run build        # type-check and build to dist/
+```
+
+The dev server forwards `/api` to Django (`VITE_API_PROXY`, default
+`http://localhost:8000`), so the browser talks to one origin and the backend
+needs no CORS setup. Without a Celery worker, set `CELERY_TASK_ALWAYS_EAGER=True`
+so a run executes inside the request that starts it.
+
+### The PDF report
+
+`GET /api/v1/test-runs/<id>/report.pdf` renders, with ReportLab:
+
+- the API, target, status and timings;
+- results at a glance and findings by severity;
+- the latest completed AI analysis: summary, verdict counts and likely root
+  causes, clearly marked as advisory;
+- a per-endpoint table of cases, passes, failures and findings;
+- every finding, most severe first (up to 300): what was expected and what came
+  back, the request and an excerpt of the response body, and the AI assessment
+  beside it.
+
+Run credentials never appear: the report is built from stored evidence, which
+is redacted when it is written. The built-in PDF fonts cover Western European
+text only; other characters print as `?`.
+
 ## Tests
 
 ```bash
@@ -125,6 +175,7 @@ database).
 | ------ | ----------------------------------------------- | ------------------------------------------ |
 | GET    | `/api/health/`                                  | Liveness probe. Returns `{"status": "ok"}` |
 | POST   | `/api/v1/specifications/`                       | Register a specification                   |
+| POST   | `/api/v1/specifications/upload/`                | Upload a JSON/YAML file and import it      |
 | GET    | `/api/v1/specifications/`                       | List specifications                        |
 | GET    | `/api/v1/specifications/<id>/`                  | Retrieve one specification                 |
 | GET    | `/api/v1/specifications/<id>/endpoints/`        | Endpoints of a specification               |
@@ -147,6 +198,8 @@ database).
 | GET    | `/api/v1/analyses/`                             | List; `?test_run=<id>` / `?rules_run=<id>` |
 | GET    | `/api/v1/analyses/<id>/`                        | Summary, groups, verdict counts, usage     |
 | GET    | `/api/v1/analyses/<id>/assessments/`            | One assessment per finding                 |
+| GET    | `/api/v1/test-runs/<id>/report.pdf`             | PDF report; `?inline=1` to view in-browser |
+| GET    | `/api/v1/features/`                             | Whether AI analysis is turned on           |
 
 `/api/health/` is intentionally unversioned: it is an infrastructure probe, not
 part of the product contract.

@@ -130,6 +130,9 @@ EXECUTOR_VERIFY_TLS = env_bool("EXECUTOR_VERIFY_TLS", default=True)
 # allows subdomains: ".example.com".
 EXECUTOR_ALLOWED_HOSTS = env_list("EXECUTOR_ALLOWED_HOSTS", "")
 
+# Largest specification file accepted by the upload endpoint.
+SPEC_UPLOAD_MAX_BYTES = int(env("SPEC_UPLOAD_MAX_BYTES", "5242880"))
+
 # --- LLM analysis -------------------------------------------------------------
 
 # Off by default. An analysis sends a run's findings and evidence — request

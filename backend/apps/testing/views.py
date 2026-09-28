@@ -7,7 +7,10 @@ the same operations remain callable from a Celery task.
 
 from __future__ import annotations
 
+from django.conf import settings
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils.text import slugify
 from rest_framework import generics, status
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -27,6 +30,7 @@ from apps.testing.serializers import (
     RulesRunSerializer,
     ScenarioResultSerializer,
     SpecificationSerializer,
+    SpecificationUploadSerializer,
     TestCaseSerializer,
     TestRunSerializer,
 )
@@ -272,3 +276,60 @@ class AnalysisAssessmentListView(generics.ListAPIView):
     def get_queryset(self):
         analysis = get_object_or_404(Analysis, pk=self.kwargs["analysis_id"])
         return services.list_assessments(analysis=analysis)
+
+
+class SpecificationUploadView(APIView):
+    """Upload a Swagger/OpenAPI file: create the specification and import it.
+
+    Returns 201 with the specification and what the import did. A document
+    that cannot be imported is a 400 and leaves nothing behind.
+    """
+
+    def post(self, request: Request) -> Response:
+        payload = SpecificationUploadSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        upload = payload.validated_data["file"]
+        if upload.size > settings.SPEC_UPLOAD_MAX_BYTES:
+            return Response(
+                {"file": [f"The file is larger than {settings.SPEC_UPLOAD_MAX_BYTES} bytes."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        specification, result = services.upload_specification(
+            content=upload.read(),
+            filename=upload.name or "",
+            name=payload.validated_data["name"],
+            version=payload.validated_data["version"],
+        )
+        specification = services.list_specifications().get(pk=specification.pk)
+        return Response(
+            {
+                "specification": SpecificationSerializer(specification).data,
+                "import": ImportResultSerializer(result).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class TestRunReportView(APIView):
+    """The run as a PDF: results, endpoints, findings and the latest AI analysis."""
+
+    def get(self, request: Request, test_run_id: int) -> HttpResponse:
+        test_run = get_object_or_404(TestRun, pk=test_run_id)
+        pdf = services.test_run_report_pdf(test_run=test_run)
+        filename = f"aegistest-{slugify(test_run.specification.name) or 'api'}-run-{test_run.pk}.pdf"
+        response = HttpResponse(pdf, content_type="application/pdf")
+        disposition = "inline" if request.query_params.get("inline") else "attachment"
+        response["Content-Disposition"] = f'{disposition}; filename="{filename}"'
+        return response
+
+
+class FeaturesView(APIView):
+    """What this deployment has turned on, so a client can show or hide it."""
+
+    def get(self, request: Request) -> Response:
+        return Response(
+            {
+                "llm_analysis": settings.LLM_ANALYSIS_ENABLED,
+                "llm_model": settings.LLM_MODEL if settings.LLM_ANALYSIS_ENABLED else "",
+            }
+        )

@@ -8,7 +8,7 @@
 | PostgreSQL     | System of record: specs, test cases, requests, responses, findings |
 | Redis          | Celery broker and result backend                                   |
 | Celery worker  | Long-running work: executing API tests, LLM analysis               |
-| React frontend | Dashboard for test runs and findings (later)                       |
+| React frontend | Dashboard: upload specs, run tests, read findings, download PDFs   |
 
 ## Code layout
 
@@ -356,4 +356,26 @@ batch is assessed and summarised in a single request; a larger one is
 summarised in a final request that reads only each assessment's digest, not
 the evidence again. Requests stream, so a large output ceiling for adaptive
 thinking cannot run into an HTTP timeout.
+
+## Dashboard and reports
+
+`frontend/` is a single-page React app that only talks to `/api/v1/`. It holds
+no rules of its own: it uploads, starts and polls, and renders what the API
+returns. The Vite dev server proxies `/api`, keeping one origin and leaving the
+API free of CORS configuration while it has no authentication.
+
+**Upload is one transaction.** `services.upload_specification` decodes the
+file (JSON, else YAML), creates the specification and imports it; a document
+that cannot be imported leaves nothing behind. YAML anchors and aliases are
+refused, because a small file of nested aliases expands into a huge document
+once it is copied into a JSON column.
+
+**The PDF is rendered on the server.** `apps/testing/report.py` is pure: it
+takes a `RunReport` of dataclasses and returns bytes, and
+`services.test_run_report` assembles that from the database. A report
+therefore looks the same whoever downloads it, can be fetched by a script or
+attached to an email without a browser, and cannot contain anything the API
+itself would not return. All text is escaped before ReportLab's paragraph
+markup reads it, since a response body is arbitrary text chosen by the API
+under test.
 
