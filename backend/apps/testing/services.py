@@ -27,9 +27,14 @@ from django.utils import timezone
 
 from apps.core.exceptions import DomainError
 from apps.testing import evaluation, executor, generator, openapi
+from apps.testing.analysis import prompts as analysis_prompts
+from apps.testing.analysis.client import Analyst, AnalystError
 from apps.testing.models import (
+    Analysis,
+    AssessmentVerdict,
     Endpoint,
     Finding,
+    FindingAssessment,
     FindingCategory,
     FindingSeverity,
     RequestRecord,
@@ -1147,12 +1152,377 @@ def list_rule_exchanges(*, rules_run: RulesRun) -> models.QuerySet[RuleExchange]
 
 def list_rules_findings(*, rules_run: RulesRun) -> models.QuerySet[Finding]:
     """A run's findings, most severe first."""
-    rank = models.Case(
-        *(models.When(severity=severity, then=position) for severity, position in _SEVERITY_RANK.items()),
-        output_field=models.IntegerField(),
-    )
     return (
         Finding.objects.filter(scenario_result__rules_run=rules_run)
         .select_related("scenario_result")
-        .order_by(rank, "id")
+        .order_by(_severity_rank("severity"), "id")
+    )
+
+
+# --- LLM analysis ---------------------------------------------------------------
+#
+# An analysis asks a language model for a second opinion on each of a finished
+# run's findings, and for a summary that groups findings sharing one cause.
+# It writes Analysis and FindingAssessment rows and nothing else: a finding's
+# severity, category and triage status are never changed by a model.
+
+
+@dataclass
+class AnalysisSummary:
+    analysis_id: int
+    findings: int = 0
+    assessed: int = 0
+    requests: int = 0
+    warnings: int = 0
+
+
+def start_analysis(
+    *,
+    test_run: TestRun | None = None,
+    rules_run: RulesRun | None = None,
+    enqueue: bool = True,
+) -> Analysis:
+    """Check a run can be analysed, create a RUNNING analysis, queue it.
+
+    The run is locked while it is checked, so two simultaneous requests cannot
+    both start an analysis of it. ``enqueue=False`` is for a caller that
+    executes the analysis itself.
+    """
+    if not settings.LLM_ANALYSIS_ENABLED:
+        raise DomainError(
+            "LLM analysis is turned off. Set LLM_ANALYSIS_ENABLED=True and provide "
+            "ANTHROPIC_API_KEY to use it."
+        )
+    if (test_run is None) == (rules_run is None):
+        raise DomainError("Analyse either a test run or a rules run.")
+
+    with transaction.atomic():
+        if test_run is not None:
+            run = TestRun.objects.select_for_update().get(pk=test_run.pk)
+        else:
+            run = RulesRun.objects.select_for_update().get(pk=rules_run.pk)
+        if not run.is_finished:
+            raise DomainError(
+                f"Only a finished run can be analysed; this one is '{run.status}'."
+            )
+        if run.analyses.filter(
+            status__in=[TestRunStatus.PENDING, TestRunStatus.RUNNING]
+        ).exists():
+            raise DomainError("This run is already being analysed.")
+
+        analysis = Analysis(
+            test_run=run if test_run is not None else None,
+            rules_run=run if rules_run is not None else None,
+            status=TestRunStatus.RUNNING,
+            model=settings.LLM_MODEL,
+            effort=settings.LLM_EFFORT,
+            started_at=timezone.now(),
+        )
+        analysis.full_clean()
+        analysis.save()
+        if enqueue:
+            transaction.on_commit(lambda: _enqueue_analysis(analysis.pk))
+    return analysis
+
+
+def _enqueue_analysis(analysis_id: int) -> None:
+    from apps.testing.tasks import run_analysis_task
+
+    try:
+        run_analysis_task.delay(analysis_id)
+    except Exception as exc:
+        logger.exception("Could not queue analysis %s", analysis_id)
+        _fail_analysis(
+            Analysis.objects.get(pk=analysis_id),
+            f"The analysis could not be queued: {exc}",
+        )
+
+
+def execute_analysis(*, analysis: Analysis, analyst: Analyst | None = None) -> AnalysisSummary:
+    """Send a RUNNING analysis's findings to the model and record its answers.
+
+    Findings go most severe first, in batches of LLM_FINDINGS_PER_REQUEST, and
+    each batch's assessments commit on their own: a failure part-way keeps
+    what was already assessed. A run that fits in one batch is assessed and
+    summarised in a single request; a larger one gets a summary request over
+    the assessments once every batch is done.
+    """
+    if analysis.status != TestRunStatus.RUNNING:
+        raise DomainError(
+            f"Only a running analysis can be executed; this one is '{analysis.status}'."
+        )
+
+    summary = AnalysisSummary(analysis_id=analysis.pk)
+    usage: dict[str, Any] = {"requests": 0, "models": []}
+    warnings: list[str] = []
+    try:
+        findings = list(_findings_to_analyse(analysis))
+        selected = findings[: settings.LLM_MAX_FINDINGS]
+        summary.findings = len(selected)
+        if len(findings) > len(selected):
+            warnings.append(
+                f"The run has {len(findings)} findings; only the {len(selected)} most "
+                f"severe were analysed (LLM_MAX_FINDINGS)."
+            )
+        analysis.findings_total = len(findings)
+        analysis.findings_selected = len(selected)
+        analysis.save(update_fields=["findings_total", "findings_selected", "updated_at"])
+
+        if not selected:
+            _complete_analysis(
+                analysis,
+                summary="The run produced no findings, so there was nothing to analyse.",
+                groups=[],
+                warnings=warnings,
+                usage=usage,
+            )
+            return summary
+
+        if analyst is None:
+            analyst = Analyst.from_settings()
+        context = _analysis_context(analysis)
+        size = max(1, settings.LLM_FINDINGS_PER_REQUEST)
+        batches = [selected[i : i + size] for i in range(0, len(selected), size)]
+        single = len(batches) == 1
+
+        assessed: list[tuple[Finding, analysis_prompts.Assessment]] = []
+        run_summary, groups = "", []
+        for batch in batches:
+            reply = analyst.ask(
+                prompt=analysis_prompts.assessment_prompt(
+                    context, [analysis_prompts.brief(f) for f in batch], include_summary=single
+                ),
+                schema=(
+                    analysis_prompts.ASSESSMENTS_AND_SUMMARY_SCHEMA
+                    if single
+                    else analysis_prompts.ASSESSMENTS_SCHEMA
+                ),
+            )
+            _add_usage(usage, reply)
+            summary.requests += 1
+            parsed = analysis_prompts.parse_assessments(
+                reply.text, sent_ids=[f.pk for f in batch], include_summary=single
+            )
+            warnings.extend(parsed.warnings)
+            by_id = {f.pk: f for f in batch}
+            batch_assessed = [(by_id[a.finding_id], a) for a in parsed.assessments]
+            with transaction.atomic():
+                FindingAssessment.objects.bulk_create(
+                    _assessment_row(analysis, finding, assessment)
+                    for finding, assessment in batch_assessed
+                )
+                analysis.usage = usage
+                analysis.warnings = warnings
+                analysis.save(update_fields=["usage", "warnings", "updated_at"])
+            assessed.extend(batch_assessed)
+            if single:
+                run_summary, groups = parsed.summary or "", parsed.groups
+
+        summary.assessed = len(assessed)
+        if not assessed:
+            _fail_analysis(
+                analysis,
+                "The model's replies did not assess any of the findings.",
+                warnings=warnings,
+                usage=usage,
+            )
+            return summary
+
+        if not single:
+            reply = analyst.ask(
+                prompt=analysis_prompts.summary_prompt(
+                    context, [analysis_prompts.digest(f, a) for f, a in assessed]
+                ),
+                schema=analysis_prompts.SUMMARY_SCHEMA,
+            )
+            _add_usage(usage, reply)
+            summary.requests += 1
+            parsed_summary = analysis_prompts.parse_summary(
+                reply.text, assessed_ids=[f.pk for f, _ in assessed]
+            )
+            warnings.extend(parsed_summary.warnings)
+            run_summary, groups = parsed_summary.summary, parsed_summary.groups
+
+        _complete_analysis(
+            analysis,
+            summary=run_summary,
+            groups=[group.as_json() for group in groups],
+            warnings=warnings,
+            usage=usage,
+        )
+    except (AnalystError, analysis_prompts.ReplyError) as exc:
+        # Expected failures: the provider, the credentials, a refusal, an
+        # unusable reply. Recorded on the analysis rather than raised.
+        _fail_analysis(analysis, str(exc), warnings=warnings, usage=usage)
+    except Exception as exc:
+        _fail_analysis(
+            analysis, f"The analysis stopped unexpectedly: {exc}", warnings=warnings, usage=usage
+        )
+        raise
+    finally:
+        summary.warnings = len(warnings)
+    return summary
+
+
+def _findings_to_analyse(analysis: Analysis) -> models.QuerySet[Finding]:
+    """The run's findings, most severe first, loaded with what a brief reads."""
+    if analysis.test_run_id:
+        queryset = Finding.objects.filter(test_case__test_run_id=analysis.test_run_id)
+    else:
+        queryset = Finding.objects.filter(scenario_result__rules_run_id=analysis.rules_run_id)
+    return queryset.select_related("test_case__endpoint", "scenario_result").order_by(
+        _severity_rank("severity"), "id"
+    )
+
+
+def _analysis_context(analysis: Analysis) -> dict[str, Any]:
+    """What the model is told about the run itself. Never its headers or setup."""
+    if analysis.test_run_id:
+        run = analysis.test_run
+        context: dict[str, Any] = {
+            "kind": "generated test cases",
+            "results": summarise_test_run(run),
+        }
+    else:
+        run = analysis.rules_run
+        context = {
+            "kind": "business rules",
+            "today": run.today.isoformat() if run.today else None,
+            "rules_file": analysis_prompts.clip(run.rules_text),
+            "results": summarise_rules_run(run),
+        }
+    context.update(
+        {
+            "name": run.name,
+            "specification": str(run.specification),
+            "base_url": run.base_url,
+            "status": run.status,
+            "status_detail": run.status_detail,
+        }
+    )
+    return context
+
+
+def _assessment_row(
+    analysis: Analysis, finding: Finding, assessment: analysis_prompts.Assessment
+) -> FindingAssessment:
+    return FindingAssessment(
+        analysis=analysis,
+        finding=finding,
+        verdict=assessment.verdict,
+        confidence=assessment.confidence,
+        suggested_severity=assessment.suggested_severity,
+        reasoning=assessment.reasoning,
+        likely_cause=assessment.likely_cause,
+        recommendation=assessment.recommendation,
+    )
+
+
+def _add_usage(usage: dict[str, Any], reply: Any) -> None:
+    usage["requests"] = usage.get("requests", 0) + 1
+    for name, count in reply.usage.items():
+        usage[name] = usage.get(name, 0) + count
+    if reply.model and reply.model not in usage["models"]:
+        usage["models"].append(reply.model)
+
+
+def _complete_analysis(
+    analysis: Analysis,
+    *,
+    summary: str,
+    groups: list[dict[str, Any]],
+    warnings: list[str],
+    usage: dict[str, Any],
+) -> None:
+    analysis.status = TestRunStatus.COMPLETED
+    analysis.summary = summary
+    analysis.groups = groups
+    analysis.warnings = warnings
+    analysis.usage = usage
+    analysis.completed_at = timezone.now()
+    analysis.save(
+        update_fields=[
+            "status",
+            "summary",
+            "groups",
+            "warnings",
+            "usage",
+            "completed_at",
+            "updated_at",
+        ]
+    )
+
+
+def _fail_analysis(
+    analysis: Analysis,
+    detail: str,
+    *,
+    warnings: list[str] | None = None,
+    usage: dict[str, Any] | None = None,
+) -> None:
+    analysis.refresh_from_db()
+    if analysis.is_finished:
+        return
+    now = timezone.now()
+    analysis.status = TestRunStatus.FAILED
+    analysis.status_detail = detail
+    analysis.started_at = analysis.started_at or now
+    analysis.completed_at = now
+    fields = ["status", "status_detail", "started_at", "completed_at", "updated_at"]
+    if warnings is not None:
+        analysis.warnings = warnings
+        fields.append("warnings")
+    if usage is not None:
+        analysis.usage = usage
+        fields.append("usage")
+    analysis.save(update_fields=fields)
+
+
+_VERDICT_COUNTS = {
+    f"{verdict}_count": models.Count(
+        "assessments", filter=models.Q(assessments__verdict=verdict), distinct=True
+    )
+    for verdict in AssessmentVerdict.values
+}
+
+
+def list_analyses(
+    *, test_run: TestRun | None = None, rules_run: RulesRun | None = None
+) -> models.QuerySet[Analysis]:
+    queryset = Analysis.objects.annotate(
+        assessed_count=models.Count("assessments", distinct=True), **_VERDICT_COUNTS
+    ).order_by(*Analysis._meta.ordering)
+    if test_run is not None:
+        queryset = queryset.filter(test_run=test_run)
+    if rules_run is not None:
+        queryset = queryset.filter(rules_run=rules_run)
+    return queryset
+
+
+def summarise_analysis(analysis: Analysis) -> dict[str, int]:
+    """How many findings were assessed, and how many got each verdict."""
+    if not hasattr(analysis, "assessed_count"):
+        analysis = list_analyses().get(pk=analysis.pk)
+    summary = {"assessed": analysis.assessed_count}
+    summary.update(
+        {verdict: getattr(analysis, f"{verdict}_count") for verdict in AssessmentVerdict.values}
+    )
+    return summary
+
+
+def list_assessments(*, analysis: Analysis) -> models.QuerySet[FindingAssessment]:
+    """An analysis's assessments, in the order of their findings' severity."""
+    return (
+        analysis.assessments.select_related("finding")
+        .order_by(_severity_rank("finding__severity"), "finding_id")
+    )
+
+
+def _severity_rank(field_name: str) -> models.Case:
+    return models.Case(
+        *(
+            models.When(**{field_name: severity}, then=position)
+            for severity, position in _SEVERITY_RANK.items()
+        ),
+        output_field=models.IntegerField(),
     )

@@ -11,3 +11,4 @@ httpx==0.28.1
 jsonpath-ng==1.8.0
 PyYAML==6.0.3
 simpleeval==1.0.8
+anthropic==1.8.0

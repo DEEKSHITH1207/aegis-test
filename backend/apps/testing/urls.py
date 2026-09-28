@@ -68,4 +68,21 @@ urlpatterns = [
         views.RulesRunFindingListView.as_view(),
         name="rules-run-finding-list",
     ),
+    path(
+        "test-runs/<int:test_run_id>/analyse/",
+        views.TestRunAnalyseView.as_view(),
+        name="test-run-analyse",
+    ),
+    path(
+        "rules-runs/<int:rules_run_id>/analyse/",
+        views.RulesRunAnalyseView.as_view(),
+        name="rules-run-analyse",
+    ),
+    path("analyses/", views.AnalysisListView.as_view(), name="analysis-list"),
+    path("analyses/<int:pk>/", views.AnalysisDetailView.as_view(), name="analysis-detail"),
+    path(
+        "analyses/<int:analysis_id>/assessments/",
+        views.AnalysisAssessmentListView.as_view(),
+        name="analysis-assessment-list",
+    ),
 ]

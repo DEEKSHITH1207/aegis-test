@@ -7,7 +7,7 @@
 | Django + DRF   | HTTP API, validation, persistence, orchestration of test runs      |
 | PostgreSQL     | System of record: specs, test cases, requests, responses, findings |
 | Redis          | Celery broker and result backend                                   |
-| Celery worker  | Long-running work: executing API tests, LLM analysis (later)       |
+| Celery worker  | Long-running work: executing API tests, LLM analysis               |
 | React frontend | Dashboard for test runs and findings (later)                       |
 
 ## Code layout
@@ -309,3 +309,51 @@ one is set. Existing findings and `/test-runs/<id>/findings/` are unchanged.
 may be overridden; expression working lists variables in the order written,
 not in set order, so the same file and date give the same requests and the
 same finding text.
+
+## LLM analysis
+
+```
+View ─ start_analysis ─(on commit)→ Celery task ─ execute_analysis
+                                                    │ per batch of findings:
+                                    prompts.brief → client.Analyst.ask → prompts.parse_assessments
+                                                    → FindingAssessment rows (one commit per batch)
+                                    then prompts.summary_prompt → parse_summary → Analysis.summary, groups
+```
+
+`apps/testing/analysis/` repeats the split used for execution and rules.
+`prompts.py` is pure: it turns loaded findings into the text the model reads
+and turns a reply back into checked dataclasses; a test asserts it imports
+nothing that can reach the network. `client.py` is the only module that talks
+to Anthropic, and it turns every way a request can fail — an API error, a
+refusal, a reply cut off at the token limit — into one `AnalystError`.
+`services.py` sequences them and owns persistence.
+
+**The model is never the source of truth.** This is the rule the README
+states, and the schema enforces it: an analysis writes `Analysis` and
+`FindingAssessment` rows and has no code path that writes a `Finding`. The
+deterministic verdicts remain the record, and the model's opinion sits beside
+them for a person to weigh. It also bounds prompt injection. Evidence is text
+the API under test chose, so a hostile API could try to steer the model, but
+the most it can reach is an advisory row.
+
+**A reply is checked, not trusted.** Structured outputs guarantee the reply's
+shape. They cannot guarantee that it refers to the right rows. Each
+assessment must name a finding that was in its batch, only the first
+assessment of a finding counts, and a group may cite only assessed findings.
+Anything else is dropped into `warnings`, so a hallucinated ID cannot attach a
+conclusion to the wrong finding.
+
+**Opt-in, because it leaves the building.** An analysis sends response bodies
+from the API under test to a third party and costs money, so
+`LLM_ANALYSIS_ENABLED` is off by default and nothing runs until someone
+asks for it. What is sent is built from stored rows, which were redacted when
+they were written. A run's headers and a rules run's setup values are never
+stored on those rows, so they cannot be sent.
+
+**Batches keep requests bounded.** Findings go most severe first, so a cap
+(`LLM_MAX_FINDINGS`) drops the least important. A run small enough for one
+batch is assessed and summarised in a single request; a larger one is
+summarised in a final request that reads only each assessment's digest, not
+the evidence again. Requests stream, so a large output ceiling for adaptive
+thinking cannot run into an HTTP timeout.
+

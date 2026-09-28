@@ -10,7 +10,7 @@ from __future__ import annotations
 from celery import shared_task
 
 from apps.testing import services
-from apps.testing.models import RulesRun, TestRun
+from apps.testing.models import Analysis, RulesRun, TestRun
 
 
 @shared_task(name="testing.execute_test_run", ignore_result=True)
@@ -31,3 +31,11 @@ def run_rules_task(rules_run_id: int, setup_values: dict[str, str]) -> None:
     if rules_run is None:
         return
     services.execute_rules_run(rules_run=rules_run, setup_values=setup_values)
+
+
+@shared_task(name="testing.run_analysis", ignore_result=True)
+def run_analysis_task(analysis_id: int) -> None:
+    analysis = Analysis.objects.filter(pk=analysis_id).first()
+    if analysis is None:
+        return
+    services.execute_analysis(analysis=analysis)

@@ -14,9 +14,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.testing import services
-from apps.testing.models import RulesRun, Specification, TestRun
+from apps.testing.models import Analysis, RulesRun, Specification, TestRun
 from apps.testing.serializers import (
+    AnalysisSerializer,
     EndpointSerializer,
+    FindingAssessmentSerializer,
     FindingSerializer,
     GenerationResultSerializer,
     ImportResultSerializer,
@@ -214,3 +216,59 @@ class RulesRunFindingListView(_RulesRunChildListView):
 
     def get_queryset(self):
         return services.list_rules_findings(rules_run=self.rules_run())
+
+
+def _analysis_accepted(analysis: Analysis) -> Response:
+    analysis = services.list_analyses().get(pk=analysis.pk)
+    return Response(AnalysisSerializer(analysis).data, status=status.HTTP_202_ACCEPTED)
+
+
+class TestRunAnalyseView(APIView):
+    """Ask the language model for a second opinion on a finished run's findings.
+
+    Returns 202: the analysis runs on a worker. Poll it at /analyses/<id>/.
+    """
+
+    def post(self, request: Request, test_run_id: int) -> Response:
+        test_run = get_object_or_404(TestRun, pk=test_run_id)
+        return _analysis_accepted(services.start_analysis(test_run=test_run))
+
+
+class RulesRunAnalyseView(APIView):
+    """As TestRunAnalyseView, for a finished business-rules run."""
+
+    def post(self, request: Request, rules_run_id: int) -> Response:
+        rules_run = get_object_or_404(RulesRun, pk=rules_run_id)
+        return _analysis_accepted(services.start_analysis(rules_run=rules_run))
+
+
+class AnalysisListView(generics.ListAPIView):
+    """GET a page of analyses; ?test_run=<id> or ?rules_run=<id> filters."""
+
+    serializer_class = AnalysisSerializer
+
+    def get_queryset(self):
+        params = self.request.query_params
+        test_run = rules_run = None
+        if params.get("test_run"):
+            test_run = get_object_or_404(TestRun, pk=params["test_run"])
+        if params.get("rules_run"):
+            rules_run = get_object_or_404(RulesRun, pk=params["rules_run"])
+        return services.list_analyses(test_run=test_run, rules_run=rules_run)
+
+
+class AnalysisDetailView(generics.RetrieveAPIView):
+    serializer_class = AnalysisSerializer
+
+    def get_queryset(self):
+        return services.list_analyses()
+
+
+class AnalysisAssessmentListView(generics.ListAPIView):
+    """One analysis's assessment of each finding, most severe finding first."""
+
+    serializer_class = FindingAssessmentSerializer
+
+    def get_queryset(self):
+        analysis = get_object_or_404(Analysis, pk=self.kwargs["analysis_id"])
+        return services.list_assessments(analysis=analysis)

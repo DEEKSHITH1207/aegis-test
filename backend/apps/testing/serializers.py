@@ -14,8 +14,10 @@ from rest_framework import serializers
 
 from apps.testing import services
 from apps.testing.models import (
+    Analysis,
     Endpoint,
     Finding,
+    FindingAssessment,
     RuleExchange,
     RulesRun,
     ScenarioResult,
@@ -311,6 +313,64 @@ class RuleExchangeSerializer(serializers.ModelSerializer):
             "response_body",
             "response_time_ms",
             "error",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class AnalysisSerializer(serializers.ModelSerializer):
+    results = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Analysis
+        fields = [
+            "id",
+            "test_run",
+            "rules_run",
+            "status",
+            "status_detail",
+            "model",
+            "effort",
+            "summary",
+            "groups",
+            "warnings",
+            "findings_total",
+            "findings_selected",
+            "results",
+            "usage",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_results(self, analysis: Analysis) -> dict[str, int]:
+        return services.summarise_analysis(analysis)
+
+
+class FindingAssessmentSerializer(serializers.ModelSerializer):
+    # The finding's own title and severity, so an assessment reads on its own
+    # and a suggested severity can be compared without a second request.
+    finding_title = serializers.CharField(source="finding.title", read_only=True)
+    finding_severity = serializers.CharField(source="finding.severity", read_only=True)
+    finding_category = serializers.CharField(source="finding.category", read_only=True)
+
+    class Meta:
+        model = FindingAssessment
+        fields = [
+            "id",
+            "analysis",
+            "finding",
+            "finding_title",
+            "finding_severity",
+            "finding_category",
+            "verdict",
+            "confidence",
+            "suggested_severity",
+            "reasoning",
+            "likely_cause",
+            "recommendation",
             "created_at",
         ]
         read_only_fields = fields

@@ -130,6 +130,25 @@ EXECUTOR_VERIFY_TLS = env_bool("EXECUTOR_VERIFY_TLS", default=True)
 # allows subdomains: ".example.com".
 EXECUTOR_ALLOWED_HOSTS = env_list("EXECUTOR_ALLOWED_HOSTS", "")
 
+# --- LLM analysis -------------------------------------------------------------
+
+# Off by default. An analysis sends a run's findings and evidence — request
+# and response bodies from the API under test — to Anthropic, and every one
+# costs money, so a deployment opts in. Credentials are not settings: the
+# Anthropic SDK reads ANTHROPIC_API_KEY from the environment.
+LLM_ANALYSIS_ENABLED = env_bool("LLM_ANALYSIS_ENABLED", default=False)
+LLM_MODEL = env("LLM_MODEL", "claude-opus-5")
+# low | medium | high | xhigh | max. Empty leaves the model's default.
+LLM_EFFORT = env("LLM_EFFORT", "high")
+# Re-run a request the model's safety classifiers decline on Anthropic's
+# recommended fallback model. Turn off for a model that does not support it.
+LLM_REFUSAL_FALLBACK = env_bool("LLM_REFUSAL_FALLBACK", default=True)
+# Findings sent per request, and at most per analysis (most severe first).
+LLM_FINDINGS_PER_REQUEST = int(env("LLM_FINDINGS_PER_REQUEST", "20"))
+LLM_MAX_FINDINGS = int(env("LLM_MAX_FINDINGS", "200"))
+LLM_TIMEOUT_SECONDS = float(env("LLM_TIMEOUT_SECONDS", "600"))
+LLM_MAX_RETRIES = int(env("LLM_MAX_RETRIES", "3"))
+
 # --- REST framework -----------------------------------------------------------
 
 REST_FRAMEWORK = {
@@ -176,5 +195,5 @@ LOGGING = {
     },
     "root": {"handlers": ["console"], "level": env("DJANGO_LOG_LEVEL", "INFO")},
     # httpx logs every request at INFO; a test run sends hundreds.
-    "loggers": {"httpx": {"level": "WARNING"}},
+    "loggers": {"httpx": {"level": "WARNING"}, "httpx2": {"level": "WARNING"}},
 }

@@ -139,6 +139,20 @@ class FindingStatus(models.TextChoices):
     RESOLVED = "resolved", "Resolved"
 
 
+class AssessmentVerdict(models.TextChoices):
+    """What the language model made of a finding's evidence. Advisory only."""
+
+    LIKELY_REAL = "likely_real", "Likely a real defect"
+    LIKELY_FALSE_POSITIVE = "likely_false_positive", "Likely a false positive"
+    UNCERTAIN = "uncertain", "The evidence does not decide it"
+
+
+class AssessmentConfidence(models.TextChoices):
+    LOW = "low", "Low"
+    MEDIUM = "medium", "Medium"
+    HIGH = "high", "High"
+
+
 class TimeStampedModel(models.Model):
     """Adds creation and modification timestamps to a mutable record."""
 
@@ -620,3 +634,102 @@ class Finding(TimeStampedModel):
                 raise ValidationError(
                     {"response_record": "Response record belongs to a different test case."}
                 )
+
+
+class Analysis(TimeStampedModel):
+    """A language model's reading of one run's findings.
+
+    Advisory by construction: an analysis writes its own rows and never edits
+    a finding. The deterministic verdicts stay the record; a person triages
+    them, with the assessments as a second opinion. A run may be analysed more
+    than once — with another model, or after the prompt changes — and each
+    analysis is kept.
+    """
+
+    test_run = models.ForeignKey(
+        TestRun, on_delete=models.CASCADE, related_name="analyses", null=True, blank=True
+    )
+    rules_run = models.ForeignKey(
+        RulesRun, on_delete=models.CASCADE, related_name="analyses", null=True, blank=True
+    )
+    status = models.CharField(
+        max_length=16, choices=TestRunStatus.choices, default=TestRunStatus.PENDING
+    )
+    status_detail = models.TextField(blank=True, default="")
+    # The model asked for. A refusal fallback may have served some requests
+    # from another one; ``usage["models"]`` lists every model that answered.
+    model = models.CharField(max_length=100)
+    effort = models.CharField(max_length=16, blank=True, default="")
+    summary = models.TextField(blank=True, default="")
+    # Findings that look like one underlying problem: title, finding_ids,
+    # explanation, recommendation, severity.
+    groups = models.JSONField(blank=True, default=list)
+    warnings = models.JSONField(blank=True, default=list)
+    # How many findings the run had, and how many of them were sent. They
+    # differ when the run had more than LLM_MAX_FINDINGS.
+    findings_total = models.PositiveIntegerField(default=0)
+    findings_selected = models.PositiveIntegerField(default=0)
+    # Requests made and tokens spent, summed over every request.
+    usage = models.JSONField(blank=True, default=dict)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        verbose_name_plural = "analyses"
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(test_run__isnull=False, rules_run__isnull=True)
+                    | models.Q(test_run__isnull=True, rules_run__isnull=False)
+                ),
+                name="ck_analysis_exactly_one_source",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(completed_at__isnull=True)
+                | models.Q(started_at__isnull=False),
+                name="ck_analysis_completed_implies_started",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        source = f"test run {self.test_run_id}" if self.test_run_id else f"rules run {self.rules_run_id}"
+        return f"Analysis of {source}: {self.status}"
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status in {
+            TestRunStatus.COMPLETED,
+            TestRunStatus.FAILED,
+            TestRunStatus.CANCELLED,
+        }
+
+
+class FindingAssessment(models.Model):
+    """What one analysis concluded about one finding. Written once."""
+
+    analysis = models.ForeignKey(Analysis, on_delete=models.CASCADE, related_name="assessments")
+    finding = models.ForeignKey(Finding, on_delete=models.CASCADE, related_name="assessments")
+    verdict = models.CharField(max_length=24, choices=AssessmentVerdict.choices)
+    confidence = models.CharField(max_length=8, choices=AssessmentConfidence.choices)
+    # The severity the model would give the finding if it is real. The
+    # finding's own severity is not changed.
+    suggested_severity = models.CharField(max_length=16, choices=FindingSeverity.choices)
+    reasoning = models.TextField()
+    likely_cause = models.TextField(blank=True, default="")
+    recommendation = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["analysis", "finding"], name="uniq_assessment_per_finding"
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["finding"], name="idx_assessment_finding"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Finding {self.finding_id}: {self.verdict}"

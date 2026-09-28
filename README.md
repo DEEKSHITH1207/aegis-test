@@ -7,12 +7,14 @@ cases against a target API, analyses the responses, and reports bugs, validation
 gaps, inconsistencies and security issues. An LLM is used as a reasoning layer
 over the collected evidence — never as the sole source of truth.
 
-**Status: Phase 5 — test execution.** AegisTest reads an OpenAPI 3.x or
+**Status: Phase 6 — LLM analysis.** AegisTest reads an OpenAPI 3.x or
 Swagger 2.0 document, turns it into endpoints, generates a deterministic suite of
 test cases from their schemas, sends each one to the API under test, and records
 what came back as evidence and findings. A [business-rules file](#business-rules)
 adds multi-step scenarios that catch wrong values in otherwise successful
-responses. LLM analysis comes in a later phase.
+responses. [LLM analysis](#llm-analysis) asks Claude for a second opinion on a
+finished run's findings — likely real or likely noise, the probable cause, what
+to do next — without ever changing a finding itself.
 
 ## Architecture
 
@@ -140,6 +142,11 @@ database).
 | GET    | `/api/v1/rules-runs/<id>/scenarios/`            | Scenarios and every rule check             |
 | GET    | `/api/v1/rules-runs/<id>/exchanges/`            | Every request/response, credentials removed|
 | GET    | `/api/v1/rules-runs/<id>/findings/`             | Broken rules, most severe first            |
+| POST   | `/api/v1/test-runs/<id>/analyse/`               | Analyse a finished run's findings (202)    |
+| POST   | `/api/v1/rules-runs/<id>/analyse/`              | Analyse a finished rules run (202)         |
+| GET    | `/api/v1/analyses/`                             | List; `?test_run=<id>` / `?rules_run=<id>` |
+| GET    | `/api/v1/analyses/<id>/`                        | Summary, groups, verdict counts, usage     |
+| GET    | `/api/v1/analyses/<id>/assessments/`            | One assessment per finding                 |
 
 `/api/health/` is intentionally unversioned: it is an infrastructure probe, not
 part of the product contract.
@@ -573,3 +580,105 @@ where it is: unknown keys, undefined variables (a step can only use values saved
 by earlier steps), bad JSON paths, expression syntax, unknown step names in
 `after`. A step whose request is not an operation of the specification is a
 warning, not an error.
+
+## LLM analysis
+
+The deterministic checks above decide what is a finding. They cannot tell a
+real defect from an artefact of the test — a happy path that got `404` because
+the example ID does not exist in your data, a "below minimum" value the schema
+actually allows, a business rule whose expected value was worked out wrongly.
+An analysis sends a finished run's findings, with their evidence, to Claude and
+records a second opinion on each one.
+
+**Advisory only.** An analysis writes its own rows. It never changes a finding's
+severity, category or triage status; a person still triages every finding, with
+the assessment next to it.
+
+```bash
+# In .env: LLM_ANALYSIS_ENABLED=True and ANTHROPIC_API_KEY=...
+curl -X POST http://localhost:8000/api/v1/test-runs/1/analyse/   # 202, runs on the worker
+curl http://localhost:8000/api/v1/analyses/1/                    # poll: status, summary, groups
+curl http://localhost:8000/api/v1/analyses/1/assessments/
+```
+
+Without a worker, run it in the foreground:
+
+```bash
+python manage.py analyse_run --test-run 1
+python manage.py analyse_run --rules-run 1
+# Analysis 1 completed: 15 of 15 findings assessed in 1 requests — 11 likely real,
+# 3 likely false positives, 1 uncertain.
+```
+
+### What comes back
+
+Each **assessment** (one per finding) has:
+
+| Field | |
+| --- | --- |
+| `verdict` | `likely_real`, `likely_false_positive` or `uncertain` |
+| `confidence` | `low`, `medium` or `high` |
+| `suggested_severity` | What the model would rate it if real; compare with `finding_severity` |
+| `reasoning` | Why, citing the evidence |
+| `likely_cause` | Best hypothesis for the cause in the API or its document |
+| `recommendation` | The fix, or what to check to confirm |
+
+The **analysis** has a `summary` for whoever triages the run, and `groups`:
+findings that look like one underlying problem (say, every validation gap on
+one endpoint), each with its `finding_ids`, an explanation and one
+recommendation. `results` counts assessments by verdict; `usage` sums the
+requests and tokens spent; `warnings` lists anything the model got wrong that
+was discarded.
+
+### How it works
+
+- Findings are sent most severe first, `LLM_FINDINGS_PER_REQUEST` at a time. A
+  run that fits in one request is assessed and summarised in that request;
+  a larger one gets one more request for the summary.
+- The reply is constrained to a JSON schema, then checked: an assessment of a
+  finding that was not sent, a second assessment of the same finding, or a
+  group citing an unassessed finding is dropped and reported in `warnings`.
+- Each batch commits on its own. If a request fails part-way, the analysis is
+  `failed` with the reason in `status_detail`, and the batches already
+  assessed are kept.
+- A run can be analysed again (another model, another effort level); each
+  analysis is kept. Only one analysis of a run may be in progress at a time.
+
+### What is sent to Anthropic
+
+For each finding: its title, description, severity, category and evidence —
+the request that was sent and an excerpt of the response body — plus the
+endpoint's path, parameters and request schema, or the scenario name and the
+rules file. Credentials are redacted from evidence before it is ever stored,
+and a run's `headers` and a rules run's setup values are never sent. Response
+bodies from the API under test *are* sent: if those can hold personal data,
+decide whether that is acceptable before turning analysis on.
+
+The evidence is untrusted text from the API under test, and could try to
+instruct the model. The prompt tells the model to ignore any such text, and
+because an analysis can only write advisory rows, the worst a successful
+injection can do is write a misleading assessment.
+
+### Settings
+
+| Variable | Default | |
+| --- | --- | --- |
+| `LLM_ANALYSIS_ENABLED` | `False` | Nothing is sent until this is `True` |
+| `ANTHROPIC_API_KEY` | — | Read by the Anthropic SDK, not by Django settings |
+| `LLM_MODEL` | `claude-opus-5` | |
+| `LLM_EFFORT` | `high` | `low` … `max`; lower is cheaper and faster |
+| `LLM_REFUSAL_FALLBACK` | `True` | Re-run a request the model's safety classifiers decline on Anthropic's recommended fallback model; `False` for models that do not support it |
+| `LLM_FINDINGS_PER_REQUEST` | `20` | Lower it if replies are cut off |
+| `LLM_MAX_FINDINGS` | `200` | Per analysis; the rest are reported in `warnings` |
+| `LLM_TIMEOUT_SECONDS` | `600` | Per request |
+| `LLM_MAX_RETRIES` | `3` | For rate limits, overload and 5xx |
+
+### Analysis limitations
+
+- The AegisTest API has no authentication yet, so anyone who can reach it can
+  start an analysis and spend your Anthropic credit. Keep it private.
+- An analysis stuck in `running` because its worker died blocks new analyses of
+  that run; there is no cancel yet.
+- Assessments are not yet shown next to findings in `/findings/`; read them
+  from the analysis.
+
