@@ -1,0 +1,12 @@
+# Builds the dashboard, then serves it with Caddy. Build context: the repository root.
+
+FROM node:20-alpine AS dashboard
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
+FROM caddy:2.8-alpine
+COPY deploy/Caddyfile /etc/caddy/Caddyfile
+COPY --from=dashboard /app/dist /srv

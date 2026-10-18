@@ -1,0 +1,29 @@
+# The front door: the only service reachable from outside.
+#
+# SITE_ADDRESS is a domain (aegis.example.com) for automatic HTTPS, or ":80"
+# to serve plain HTTP on the server's IP for a first test.
+{$SITE_ADDRESS}
+
+encode gzip
+
+# One shared login for the whole team. AegisTest has no accounts of its own,
+# so this is what keeps strangers from using the server to send requests.
+basic_auth {
+	{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+}
+
+handle /api/* {
+	reverse_proxy {$BACKEND_UPSTREAM:backend:8000} {
+		# The browser repeats the login on every request. Django REST
+		# framework would try it as a Django user and answer 401.
+		header_up -Authorization
+	}
+}
+
+# The built dashboard. Unknown paths fall back to index.html so the React
+# router can handle /runs/12 and the like on a reload.
+handle {
+	root * {$SITE_ROOT:/srv}
+	try_files {path} /index.html
+	file_server
+}
