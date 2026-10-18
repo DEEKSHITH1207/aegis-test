@@ -15,6 +15,7 @@ from rest_framework import serializers
 from apps.testing import openapi, services
 from apps.testing.models import (
     Analysis,
+    CreatedResource,
     Endpoint,
     Finding,
     FindingAssessment,
@@ -108,6 +109,7 @@ class TestRunSerializer(serializers.ModelSerializer):
         child=serializers.CharField(max_length=100), required=False, write_only=True
     )
     scope = serializers.SerializerMethodField()
+    resources = serializers.SerializerMethodField()
 
     class Meta:
         model = TestRun
@@ -122,6 +124,8 @@ class TestRunSerializer(serializers.ModelSerializer):
             "endpoints",
             "tags",
             "scope",
+            "cleanup",
+            "resources",
             "status",
             "status_detail",
             "results",
@@ -149,6 +153,10 @@ class TestRunSerializer(serializers.ModelSerializer):
     def get_scope(self, test_run: TestRun) -> dict[str, Any]:
         return services.describe_scope(test_run)
 
+    def get_resources(self, test_run: TestRun) -> dict[str, int]:
+        summary = services.summarise_resources(test_run)
+        return {"deleted": summary.deleted, "failed": summary.failed, "left": summary.left}
+
 
 class TestCaseSerializer(serializers.ModelSerializer):
     class Meta:
@@ -162,6 +170,7 @@ class TestCaseSerializer(serializers.ModelSerializer):
             "test_type",
             "input_data",
             "expected_status_code",
+            "oracle",
             "status",
             "status_detail",
             "created_at",
@@ -191,12 +200,38 @@ class FindingSerializer(serializers.ModelSerializer):
             "description",
             "severity",
             "category",
+            "confidence",
+            "probable_cause",
+            "reproduction",
             "evidence",
             "status",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class CreatedResourceSerializer(serializers.ModelSerializer):
+    endpoint_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CreatedResource
+        fields = [
+            "id",
+            "test_case",
+            "endpoint",
+            "endpoint_label",
+            "resource_id",
+            "delete_url",
+            "status",
+            "detail",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_endpoint_label(self, resource: CreatedResource) -> str:
+        return f"{resource.endpoint.method} {resource.endpoint.path}"
 
 
 class SkippedOperationSerializer(serializers.Serializer):

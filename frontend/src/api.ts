@@ -5,6 +5,7 @@
 import type {
   Analysis,
   Assessment,
+  CreatedResource,
   Endpoint,
   Features,
   Finding,
@@ -134,11 +135,15 @@ export const api = {
     headers: Record<string, string>;
     /** Only these endpoints; omit or leave empty to test every endpoint. */
     endpoints?: number[];
+    /** Delete what the run creates once it has executed. */
+    cleanup?: boolean;
   }) => post<TestRun>("/test-runs/", body),
   rerun: (id: number) => post<TestRun>(`/test-runs/${id}/rerun/`),
   generate: (id: number) => post<GenerationResult>(`/test-runs/${id}/generate-tests/`),
   execute: (id: number) => post<TestRun>(`/test-runs/${id}/execute/`),
   findings: (id: number) => all<Finding>(`/test-runs/${id}/findings/`),
+  resources: (id: number) => all<CreatedResource>(`/test-runs/${id}/resources/`),
+  cleanup: (id: number) => post<CreatedResource[]>(`/test-runs/${id}/cleanup/`),
   reportUrl: (id: number, inline = false) =>
     `${BASE}/test-runs/${id}/report.pdf${inline ? "?inline=1" : ""}`,
 

@@ -56,6 +56,16 @@ urlpatterns = [
         views.TestRunFindingListView.as_view(),
         name="test-run-finding-list",
     ),
+    path(
+        "test-runs/<int:test_run_id>/resources/",
+        views.TestRunResourceListView.as_view(),
+        name="test-run-resource-list",
+    ),
+    path(
+        "test-runs/<int:test_run_id>/cleanup/",
+        views.TestRunCleanupView.as_view(),
+        name="test-run-cleanup",
+    ),
     path("rules-runs/", views.RulesRunListCreateView.as_view(), name="rules-run-list"),
     path("rules-runs/<int:pk>/", views.RulesRunDetailView.as_view(), name="rules-run-detail"),
     path(

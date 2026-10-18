@@ -298,3 +298,40 @@ def redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
 def _is_sensitive(name: str) -> bool:
     lowered = name.lower()
     return any(marker in lowered for marker in _SENSITIVE_HEADER_MARKERS)
+
+
+# Body and query fields whose values are credentials, matched on the whole
+# words of a camelCase, snake_case or kebab-case name: "accessToken" and
+# "api_key" are masked, "footprint", "secretary" and "tokenizer" are not.
+_SECRET_WORDS = {
+    "password", "passwd", "secret", "token", "apikey", "authorization", "cookie",
+    "credential", "otp", "jwt", "bearer",
+}  # fmt: skip
+# Two-word names that are secrets although neither word is on its own.
+_SECRET_PAIRS = {("api", "key"), ("private", "key"), ("secret", "key"), ("client", "secret")}
+_NAME_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def redact_body(value: Any) -> Any:
+    """A copy of a request or response body with secret-named fields masked.
+
+    Walks objects and arrays; a value whose key names a credential is replaced
+    with the same placeholder as a redacted header. Anything else is returned
+    as it is.
+    """
+    if isinstance(value, dict):
+        return {
+            str(key): REDACTED if _is_secret_field(str(key)) else redact_body(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_body(item) for item in value]
+    return value
+
+
+def _is_secret_field(name: str) -> bool:
+    words = [match.group(0).lower() for match in _NAME_WORD.finditer(name)]
+    singular = [w[:-1] if len(w) > 4 and w.endswith("s") else w for w in words]
+    if any(word in _SECRET_WORDS for word in singular):
+        return True
+    return any(pair in _SECRET_PAIRS for pair in zip(singular, singular[1:]))

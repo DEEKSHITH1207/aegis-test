@@ -156,6 +156,7 @@ function NewRunForm({
   const [scope, setScope] = useState<"all" | "some">("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [name, setName] = useState("");
+  const [cleanup, setCleanup] = useState(true);
   const [baseUrl, setBaseUrl] = useState(suggestedBaseUrl);
   const [headers, setHeaders] = useState<HeaderRow[]>([{ name: "Authorization", value: "" }]);
   const [step, setStep] = useState<string | null>(null);
@@ -187,6 +188,7 @@ function NewRunForm({
         base_url: baseUrl.trim(),
         headers: sent,
         endpoints: scope === "some" ? [...selected] : [],
+        cleanup,
       });
       runId = run.id;
       setStep("Generating test cases...");
@@ -285,6 +287,16 @@ function NewRunForm({
           </div>
           <span className="hint">Credentials are stored for the run but never shown again or put in the report.</span>
         </div>
+
+        <label className="choice" style={{ marginBottom: 14 }}>
+          <input type="checkbox" checked={cleanup} onChange={(e) => setCleanup(e.target.checked)} />
+          <span>
+            Clean up afterwards
+            <span className="hint">
+              Delete the records the run creates, where the API has a DELETE for them. Anything left is listed on the run.
+            </span>
+          </span>
+        </label>
 
         <div className="field">
           <label htmlFor="run-name">Run name (optional)</label>

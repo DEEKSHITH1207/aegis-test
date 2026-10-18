@@ -78,6 +78,9 @@ export interface TestRun {
   header_names: string[];
   endpoints: number[];
   scope: RunScope;
+  /** Delete what the run created once it has executed. */
+  cleanup: boolean;
+  resources: { deleted: number; failed: number; left: number };
   status: RunStatus;
   status_detail: string;
   results: RunResults;
@@ -101,6 +104,10 @@ export interface Finding {
   description: string;
   severity: Severity;
   category: string;
+  confidence: "" | "low" | "medium" | "high";
+  probable_cause: string;
+  /** The requests that show the problem, setup calls first. */
+  reproduction: ReproductionStep[];
   status: string;
   evidence: {
     test_type?: string;
@@ -109,6 +116,25 @@ export interface Finding {
     response?: { status_code: number | null; response_time_ms?: number; body?: unknown };
   };
   created_at: string;
+}
+
+export interface ReproductionStep {
+  step: number;
+  note: string;
+  method: string;
+  url: string;
+  body?: unknown;
+  status_code: number | null;
+}
+
+export interface CreatedResource {
+  id: number;
+  endpoint_label: string;
+  resource_id: string;
+  /** Empty when the API offers no way to delete it. */
+  delete_url: string;
+  status: "left" | "deleted" | "delete_failed";
+  detail: string;
 }
 
 export interface AnalysisGroup {

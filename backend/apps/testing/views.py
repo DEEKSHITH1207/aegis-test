@@ -16,10 +16,12 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.exceptions import DomainError
 from apps.testing import services
 from apps.testing.models import Analysis, RulesRun, Specification, TestRun
 from apps.testing.serializers import (
     AnalysisSerializer,
+    CreatedResourceSerializer,
     EndpointSerializer,
     FindingAssessmentSerializer,
     FindingSerializer,
@@ -149,6 +151,31 @@ class TestRunFindingListView(generics.ListAPIView):
     def get_queryset(self):
         test_run = get_object_or_404(TestRun, pk=self.kwargs["test_run_id"])
         return services.list_findings(test_run=test_run)
+
+
+class TestRunResourceListView(generics.ListAPIView):
+    """What a run created in the API under test, and whether it is still there."""
+
+    serializer_class = CreatedResourceSerializer
+
+    def get_queryset(self):
+        test_run = get_object_or_404(TestRun, pk=self.kwargs["test_run_id"])
+        return services.list_created_resources(test_run=test_run)
+
+
+class TestRunCleanupView(APIView):
+    """DELETE what a finished run created, where the API offers a DELETE.
+
+    Synchronous: one request per resource. Returns the run's resources.
+    """
+
+    def post(self, request: Request, test_run_id: int) -> Response:
+        test_run = get_object_or_404(TestRun, pk=test_run_id)
+        if not test_run.is_finished:
+            raise DomainError("A run can be cleaned up once it has finished.")
+        services.cleanup_test_run(test_run=test_run)
+        resources = services.list_created_resources(test_run=test_run)
+        return Response(CreatedResourceSerializer(resources, many=True).data)
 
 
 class RulesRunListCreateView(generics.ListAPIView):

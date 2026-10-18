@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import AnalysisPanel from "../components/AnalysisPanel";
 import FindingsList from "../components/FindingsList";
+import ResourcesPanel from "../components/ResourcesPanel";
 import { ErrorAlert, Loading, Spinner, StatusBadge, Tile, formatDate, scopeText } from "../components/ui";
 import { describe, useLoad } from "../hooks";
 import type { Assessment } from "../types";
@@ -152,6 +153,7 @@ export default function RunPage() {
             features={features.data}
             onStarted={analyses.reload}
           />
+          <ResourcesPanel run={r} finished={finished} />
         </div>
       </div>
     </div>

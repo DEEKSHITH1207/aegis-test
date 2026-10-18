@@ -144,9 +144,15 @@ def test_every_case_is_sent_and_judged(run: TestRun) -> None:
     assert run.started_at and run.completed_at
     total = run.test_cases.count()
     assert summary.executed == total
-    assert summary.passed + summary.failed + summary.errors == total
+    assert summary.passed + summary.failed + summary.errors + summary.skipped == total
     assert not run.test_cases.filter(status=TestCaseStatus.PENDING).exists()
-    assert RequestRecord.objects.filter(test_case__test_run=run).count() == total
+    # The one skipped case is a DELETE to id 0, which could name a real record.
+    skipped = run.test_cases.filter(status=TestCaseStatus.SKIPPED)
+    assert [c.name for c in skipped] == ["below_minimum:path.userId"]
+    assert summary.skipped == 1
+    # Every other case sent at least one request; a sequence sends more.
+    sent = RequestRecord.objects.filter(test_case__test_run=run)
+    assert sent.values("test_case").distinct().count() == total - 1
 
 
 def test_the_rules_an_api_enforces_pass(run: TestRun) -> None:
@@ -173,13 +179,15 @@ def test_the_rules_an_api_ignores_are_gaps(run: TestRun) -> None:
     assert case.findings.get().category == FindingCategory.VALIDATION_GAP
 
 
-def test_a_crash_is_reported_as_a_bug(run: TestRun) -> None:
+def test_a_crash_is_reported_as_a_crash(run: TestRun) -> None:
     _execute(run)
 
     case = run.test_cases.get(name="invalid_type:age")
     assert case.status == TestCaseStatus.FAILED
     finding = case.findings.get()
-    assert finding.category == FindingCategory.BUG
+    assert finding.category == FindingCategory.CRASH
+    assert len(finding.reproduction) == 1
+    assert finding.reproduction[0]["status_code"] == 500
     assert finding.response_record.status_code == 500
     assert finding.evidence["response"]["body"].startswith("Traceback")
     assert not isinstance(finding.evidence["request"]["body"]["age"], int)
@@ -218,7 +226,8 @@ def test_missing_credentials_leave_cases_unjudged(run: TestRun) -> None:
 
     _execute(run)
 
-    assert set(run.test_cases.values_list("status", flat=True)) == {TestCaseStatus.ERROR}
+    sent = run.test_cases.exclude(status=TestCaseStatus.SKIPPED)
+    assert set(sent.values_list("status", flat=True)) == {TestCaseStatus.ERROR}
     assert not Finding.objects.filter(test_case__test_run=run).exists()
 
 
@@ -232,9 +241,12 @@ def test_a_timeout_is_an_error_and_the_run_continues(run: TestRun) -> None:
 
     run.refresh_from_db()
     assert run.status == TestRunStatus.COMPLETED
-    deletes = run.test_cases.filter(endpoint__method="DELETE")
+    deletes = run.test_cases.filter(endpoint__method="DELETE").exclude(
+        status=TestCaseStatus.SKIPPED
+    )
     assert set(deletes.values_list("status", flat=True)) == {TestCaseStatus.ERROR}
-    record = RequestRecord.objects.filter(test_case__in=deletes).first()
+    # The happy path creates a user first; it is the DELETE itself that timed out.
+    record = RequestRecord.objects.filter(test_case__in=deletes, method="DELETE").first()
     assert "timeout" in record.error
     assert not hasattr(record, "response") or record.response is None
 

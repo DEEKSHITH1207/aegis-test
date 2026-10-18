@@ -16,8 +16,16 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from pypdf import PdfReader
 from rest_framework import status
 
-from apps.testing import openapi, report, services
-from apps.testing.models import Endpoint, Finding, Specification, TestRun
+from apps.testing import executor, openapi, report, services
+from apps.testing.models import (
+    Endpoint,
+    Finding,
+    RequestRecord,
+    ResponseRecord,
+    Specification,
+    TestCaseStatus,
+    TestRun,
+)
 from apps.testing.tests.fixtures import REALISTIC_SPECIFICATION
 from apps.testing.tests.test_analysis_service import FakeAnalyst, finished_run  # noqa: F401
 
@@ -169,7 +177,7 @@ def test_the_report_holds_the_results_endpoints_and_every_finding(finished_run: 
 
     assert "AegisTest API test report" in text
     assert "Directory API" in text
-    assert "At a glance" in text
+    assert "Executive summary" in text
     assert "POST /users" in text
     for finding in findings:
         assert f"#{finding.pk}" in text
@@ -231,6 +239,341 @@ def test_markup_and_unusual_characters_in_evidence_do_not_break_the_pdf() -> Non
 
     assert "<script>alert(1)</script> & friends" in text
     assert "[truncated]" in text
+
+
+# --- Report content ----------------------------------------------------------------
+
+
+def test_the_executive_summary_counts_come_from_the_stored_cases(finished_run: TestRun) -> None:  # noqa: F811
+    data = services.test_run_report(test_run=finished_run)
+    cases = finished_run.test_cases
+
+    assert data.results["total"] == cases.count() == data.cases_total
+    assert data.results["passed"] == cases.filter(status=TestCaseStatus.PASSED).count()
+    assert data.results["failed"] == cases.filter(status=TestCaseStatus.FAILED).count()
+    assert data.results["error"] == cases.filter(status=TestCaseStatus.ERROR).count()
+    assert data.executed == data.results["passed"] + data.results["failed"] + data.results["error"]
+    assert data.not_run == cases.filter(status=TestCaseStatus.SKIPPED).count() == 1
+    assert data.findings_total == Finding.objects.filter(test_case__test_run=finished_run).count()
+    assert sum(e.cases for e in data.endpoints) == data.cases_total
+    assert sum(e.executed for e in data.endpoints) == data.executed
+    assert all(sum(e.scenarios.values()) == e.cases for e in data.endpoints)
+
+    text = _pdf_text(report.render(data))
+    assert "Executive summary" in text
+    assert "operations executed at least one test case" in text
+    assert "Findings count problems, not cases" in text
+
+
+def test_every_executed_case_is_detailed_with_its_scenario_and_verdict(finished_run: TestRun) -> None:  # noqa: F811
+    data = services.test_run_report(test_run=finished_run)
+
+    stored = {
+        (c.pk, c.status, c.expected_status_code)
+        for c in finished_run.test_cases.all()
+    }
+    assert {(c.id, c.status, c.expected_status) for c in data.cases} == stored
+    for case in data.cases:
+        assert case.scenario in set(report.SCENARIO_LABELS.values()) | {"Validation"}, case.test_type
+        assert case.request.startswith(case.endpoint.split(" ")[0] + " ")
+        assert case.detail
+        if case.status == "skipped":
+            assert case.actual_status is None and case.requests_sent == 0
+            continue
+        assert case.actual_status is not None, case.name
+    happy = next(c for c in data.cases if c.endpoint == "POST /users" and c.name == "happy_path")
+    assert happy.scenario == "Happy path"
+    assert happy.expected_status == 201 and happy.actual_status == 201
+    assert happy.status == "passed"
+    assert "body:" in happy.request and "Bearer" not in happy.request
+
+    text = _pdf_text(report.render(data))
+    assert "Test case details" in text
+    assert f"#{happy.id}" in text
+    assert "Required-field validation" in text
+
+
+def test_an_empty_run_reports_that_nothing_was_tested() -> None:
+    specification = Specification.objects.create(
+        name="Directory API", version="1.0.0", raw_specification=deepcopy(REALISTIC_SPECIFICATION)
+    )
+    services.import_endpoints(specification=specification)
+    run = TestRun.objects.create(specification=specification, name="Empty run")
+
+    data = services.test_run_report(test_run=run)
+    text = _pdf_text(report.render(data))
+
+    assert data.cases_total == 0 and data.executed == 0 and data.findings_total == 0
+    assert data.not_tested_total == specification.endpoints.count()
+    assert "No test cases were generated for this run." in text
+    assert "nothing about the API was tested" in text
+    assert "The run produced no findings." in text
+    assert "operations of the specification executed no case in this run" in text
+
+
+def test_secrets_in_payloads_never_reach_the_report(finished_run: TestRun) -> None:  # noqa: F811
+    case = finished_run.test_cases.filter(endpoint__method="POST").first()
+    record = RequestRecord.objects.create(
+        test_case=case,
+        method="POST",
+        url="http://directory.test/api/login",
+        query_params={"api_key": "key-in-query", "page": 2},
+        body={"username": "ann", "password": "hunter2", "profile": {"token": "tok-1", "author": "ann"}},
+    )
+    response = ResponseRecord.objects.create(
+        request_record=record, status_code=200, body={"access_token": "tok-2"}, response_time_ms=3
+    )
+    Finding.objects.create(
+        test_case=case,
+        response_record=response,
+        title="Login leaks",
+        severity="high",
+        category="security",
+        confidence="high",
+        probable_cause="x",
+        evidence={
+            "request": {"method": "POST", "url": record.url, "body": record.body},
+            "response": {"status_code": 200, "body": response.body},
+        },
+        reproduction=[{"step": 1, "method": "POST", "url": record.url, "body": record.body, "status_code": 200}],
+    )
+
+    data = services.test_run_report(test_run=finished_run)
+    text = _pdf_text(report.render(data))
+
+    for secret in ("hunter2", "tok-1", "tok-2", "key-in-query"):
+        assert secret not in text, secret
+    assert executor.REDACTED in text
+    assert "ann" in text  # Ordinary values stay; "author" is not a credential.
+    assert "Bearer secret" not in text
+
+
+def test_body_redaction_masks_credentials_at_any_depth() -> None:
+    body = {"password": "p", "items": [{"apiKey": "k", "name": "n"}], "author": "a", "count": 1}
+
+    redacted = executor.redact_body(body)
+
+    assert redacted == {
+        "password": executor.REDACTED,
+        "items": [{"apiKey": executor.REDACTED, "name": "n"}],
+        "author": "a",
+        "count": 1,
+    }
+    assert executor.redact_body("plain") == "plain"
+    assert executor.redact_body(None) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "password", "Password", "user_password", "passwd", "accessToken", "refresh_token",
+        "tokens", "api_key", "apiKey", "x-api-key", "client_secret", "clientSecret",
+        "secrets", "private_key", "authorization", "cookie", "credentials", "otp", "jwt",
+    ],
+)
+def test_secret_field_names_are_recognised_by_their_words(name: str) -> None:
+    assert executor.redact_body({name: "v"}) == {name: executor.REDACTED}
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["footprint", "secretary", "tokenizer", "author", "pinned", "keyboard", "apiVersion",
+     "key", "name", "hotpot", "passwordless_login_enabled" if False else "login_enabled"],
+)
+def test_ordinary_field_names_are_not_masked(name: str) -> None:
+    assert executor.redact_body({name: "v"}) == {name: "v"}
+
+
+@pytest.mark.parametrize(
+    ("category", "severity", "confidence", "status", "group"),
+    [
+        ("crash", "high", "high", "open", "bug"),
+        ("validation_gap", "medium", "high", "open", "bug"),
+        ("state_bug", "medium", "medium", "open", "bug"),
+        ("validation_gap", "low", "low", "open", "possible"),
+        ("state_bug", "medium", "low", "open", "possible"),
+        ("spec_gap", "low", "high", "open", "documentation"),
+        ("spec_gap", "high", "high", "open", "documentation"),
+        ("schema_mismatch", "medium", "medium", "open", "documentation"),
+        ("false_positive_risk", "low", "low", "open", "inconclusive"),
+        ("crash", "high", "high", "false_positive", "dismissed"),
+        ("spec_gap", "low", "low", "confirmed", "bug"),
+    ],
+)
+def test_findings_are_grouped_by_what_their_evidence_supports(
+    category, severity, confidence, status, group
+) -> None:
+    assert report.classify_finding(category, severity, confidence, status) == group
+
+
+def test_the_findings_section_separates_bugs_from_documentation_gaps() -> None:
+    def finding(id, category, severity, confidence, status="open"):
+        return report.ReportFinding(
+            id=id, title=f"Finding {id}", severity=severity, category=category,
+            confidence=confidence, description="", endpoint="GET /x", status=status,
+        )
+    data = report.RunReport(
+        specification="API", run_name="Run", run_id=1, base_url="", status="completed",
+        status_detail="", started_at=None, completed_at=None,
+        generated_at=__import__("datetime").datetime(2026, 10, 10),
+        results={"total": 3, "passed": 2, "failed": 1},
+        findings=[
+            finding(1, "crash", "high", "high"),
+            finding(2, "spec_gap", "low", "high"),
+            finding(3, "validation_gap", "low", "low"),
+            finding(4, "crash", "high", "high", status="false_positive"),
+        ],
+        findings_total=4,
+    )
+
+    text = _pdf_text(report.render(data))
+
+    assert text.index("Bugs (1)") < text.index("Finding 1") < text.index("Possible issues (1)")
+    assert text.index("Possible issues (1)") < text.index("Finding 3") < text.index("Documentation gaps (1)")
+    assert text.index("Documentation gaps (1)") < text.index("Finding 2") < text.index("Dismissed as false positives (1)")
+    assert "Why it matters" in text
+    assert "not a defect" in text
+
+
+def test_a_large_suite_is_capped_and_still_renders() -> None:
+    cases = [
+        report.ReportCase(
+            id=i, name=f"case_{i}", endpoint=f"GET /things/{i % 7}", test_type="happy_path",
+            purpose="p" * 400, request="GET /things\nbody: " + json.dumps({"k": "v" * 2000}),
+            expected_status=200, actual_status=200, status="passed", detail="d" * 900,
+        )
+        for i in range(120)
+    ]
+    data = report.RunReport(
+        specification="API", run_name="Run", run_id=1, base_url="", status="completed",
+        status_detail="", started_at=None, completed_at=None,
+        generated_at=__import__("datetime").datetime(2026, 10, 10),
+        results={"total": 1200, "passed": 1200}, cases=cases, cases_total=1200,
+        sequences=[], sequences_total=0,
+    )
+
+    text = _pdf_text(report.render(data))
+
+    assert "The first 120 of 1200 cases are shown" in text
+    assert "[truncated]" in text
+    assert "case_119" in text
+
+
+def test_the_limitations_name_cases_never_sent_and_operations_never_tested(finished_run: TestRun) -> None:  # noqa: F811
+    skipped = finished_run.test_cases.filter(endpoint__method="DELETE")
+    skipped_count = skipped.update(
+        status=TestCaseStatus.SKIPPED, status_detail="Not sent: the target could not be reached."
+    )
+    assert skipped_count
+
+    data = services.test_run_report(test_run=finished_run)
+    text = _pdf_text(report.render(data))
+
+    assert data.not_run == skipped_count
+    assert data.not_run_reasons == [("Not sent: the target could not be reached", skipped_count)]
+    assert data.not_tested == ["DELETE /users/{userId}"]
+    assert f"{skipped_count} generated cases were never sent" in text
+    assert "DELETE /users/{userId}" in text.replace("\n", "")
+    assert "do not cover authentication" in text
+
+
+def test_untested_operations_are_judged_from_this_run_only(finished_run: TestRun) -> None:  # noqa: F811
+    """A second run on the same specification whose cases were all skipped must
+    list every operation as untested, although the first run executed them."""
+    second = services.create_test_run(
+        specification=finished_run.specification, name="Second run", base_url=finished_run.base_url
+    )
+    services.generate_test_cases_for_run(test_run=second)
+    second.test_cases.update(
+        status=TestCaseStatus.SKIPPED, status_detail="Not sent: the target could not be reached."
+    )
+
+    data = services.test_run_report(test_run=second)
+
+    operations = {f"{e.method} {e.path}" for e in finished_run.specification.endpoints.all()}
+    assert set(data.not_tested) == operations
+    assert data.not_tested_total == len(operations)
+    assert data.executed == 0 and data.not_run == second.test_cases.count()
+    # The first run is unaffected.
+    assert services.test_run_report(test_run=finished_run).not_tested == []
+
+
+def test_the_inconclusive_reasons_are_listed_in_the_limitations(finished_run: TestRun) -> None:  # noqa: F811
+    cases = finished_run.test_cases.filter(endpoint__method="GET")
+    count = cases.update(
+        status=TestCaseStatus.ERROR,
+        status_detail="The request was unauthorised (401), so the case could not be judged. Set credentials.",
+    )
+    assert count
+
+    data = services.test_run_report(test_run=finished_run)
+    text = _pdf_text(report.render(data))
+
+    assert data.results["error"] == count
+    assert data.inconclusive_reasons == [
+        ("The request was unauthorised (401), so the case could not be judged", count)
+    ]
+    assert f"{count} cases got no verdict: {count} - The request was unauthorised (401)" in text
+    assert "Errors" in text and "Error" in text  # Count tiles say Errors; a case says Error.
+
+
+def test_a_sequence_step_without_a_response_shows_its_error(finished_run: TestRun) -> None:  # noqa: F811
+    case = finished_run.test_cases.filter(endpoint__method="POST").first()
+    case.request_records.all().delete()
+    first = RequestRecord.objects.create(
+        test_case=case, method="POST", url="http://directory.test/api/users", body={"name": "a"}
+    )
+    ResponseRecord.objects.create(request_record=first, status_code=201, body={"id": 1}, response_time_ms=1)
+    RequestRecord.objects.create(
+        test_case=case, method="POST", url="http://directory.test/api/users", body={"name": "a"},
+        error="No response within the timeout (ReadTimeout).",
+    )
+
+    data = services.test_run_report(test_run=finished_run)
+    sequence = next(s for s in data.sequences if s.case == case.name and s.endpoint == "POST /users")
+    text = _pdf_text(report.render(data))
+
+    assert [step["status_code"] for step in sequence.steps] == [201, None]
+    assert sequence.steps[1]["note"] == "No response within the timeout (ReadTimeout)."
+    assert "2. POST /users -> no response - No response within the timeout" in text
+    shown = next(c for c in data.cases if c.id == case.pk)
+    assert shown.actual_status is None  # The request under test got no answer.
+
+
+def test_finding_counts_describe_the_findings_shown_when_capped() -> None:
+    findings = [
+        report.ReportFinding(
+            id=i, title=f"F{i}", severity="low", category="spec_gap", confidence="high",
+            description="", endpoint="GET /x", status="false_positive" if i == 0 else "open",
+        )
+        for i in range(3)
+    ]
+    data = report.RunReport(
+        specification="API", run_name="Run", run_id=1, base_url="", status="completed",
+        status_detail="", started_at=None, completed_at=None,
+        generated_at=__import__("datetime").datetime(2026, 10, 10),
+        results={"total": 1}, findings=findings, findings_total=500,
+    )
+
+    text = _pdf_text(report.render(data))
+
+    assert "Findings shown" in text
+    assert "The run produced 500 findings; the 3 most severe are in this report" in text
+    assert "Findings by severity (shown)" in text
+    assert "Dismissed as false positives" in text
+    assert "The 3 most severe of 500 findings are shown" in text
+
+
+def test_the_case_table_shows_how_many_findings_a_case_produced(finished_run: TestRun) -> None:  # noqa: F811
+    data = services.test_run_report(test_run=finished_run)
+    with_findings = [c for c in data.cases if c.findings]
+
+    assert with_findings
+    assert {c.id for c in with_findings} == set(
+        Finding.objects.filter(test_case__test_run=finished_run).values_list("test_case_id", flat=True)
+    )
+    text = _pdf_text(report.render(data))
+    assert "1 finding" in text
 
 
 def test_the_report_of_a_missing_run_is_404(api_client) -> None:

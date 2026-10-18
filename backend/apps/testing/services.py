@@ -12,6 +12,7 @@ paginate or count without loading rows it will not use.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import logging
 import re
 from dataclasses import dataclass, field
@@ -27,18 +28,20 @@ from django.db import models, transaction
 from django.utils import timezone
 
 from apps.core.exceptions import DomainError
-from apps.testing import evaluation, executor, generator, openapi, report
+from apps.testing import evaluation, executor, generator, openapi, oracles, report, semantic
 from apps.testing.analysis import prompts as analysis_prompts
 from apps.testing.analysis.client import Analyst, AnalystError
 from apps.testing.models import (
     Analysis,
     AssessmentVerdict,
+    CreatedResource,
     Endpoint,
     Finding,
     FindingAssessment,
     FindingCategory,
     FindingSeverity,
     RequestRecord,
+    ResourceStatus,
     ResponseRecord,
     RuleExchange,
     RulesRun,
@@ -47,6 +50,7 @@ from apps.testing.models import (
     Specification,
     TestCase,
     TestCaseStatus,
+    TestCaseType,
     TestRun,
     TestRunStatus,
 )
@@ -403,6 +407,7 @@ def rerun_test_run(*, test_run: TestRun, enqueue: bool = True) -> TestRun:
         base_url=test_run.base_url,
         headers=dict(test_run.headers) if isinstance(test_run.headers, dict) else {},
         endpoints=list(test_run.endpoints.all()),
+        cleanup=test_run.cleanup,
     )
     generate_test_cases_for_run(test_run=rerun)
     return start_execution(test_run=rerun, enqueue=enqueue)
@@ -557,6 +562,7 @@ _GENERATED_TEST_CASE_FIELDS = (
     "description",
     "input_data",
     "expected_status_code",
+    "oracle",
 )
 
 
@@ -586,6 +592,8 @@ def generate_test_cases_for_run(*, test_run: TestRun) -> GenerationResult:
         (case.endpoint_id, case.name): case
         for case in test_run.test_cases.all()
     }
+    routes = _routes(test_run)
+    seed = run_seed(test_run)
 
     for endpoint in run_endpoints(test_run):
         result.endpoints += 1
@@ -593,7 +601,14 @@ def generate_test_cases_for_run(*, test_run: TestRun) -> GenerationResult:
         expected = generator.ExpectedStatus.from_codes(
             openapi.documented_status_codes(document, endpoint.path, endpoint.method)
         )
-        generated = generator.generate_test_cases(endpoint, expected=expected)
+        generated = semantic.build_test_cases(
+            endpoint,
+            expected=expected,
+            seed=seed,
+            readable=bool(
+                _item_route(routes, endpoint.path, "GET") or routes.get(("GET", endpoint.path))
+            ),
+        )
         result.warnings.extend(generated.warnings)
 
         if generated.is_empty:
@@ -624,6 +639,7 @@ def _create_generated_test_case(
         description=definition.description,
         input_data=definition.input_data,
         expected_status_code=definition.expected_status_code,
+        oracle=definition.oracle,
     )
     test_case.full_clean()
     test_case.save()
@@ -647,6 +663,56 @@ def _apply_definition(
     test_case.full_clean()
     test_case.save(update_fields=[*changed, "updated_at"])
     return True
+
+
+def run_seed(test_run: TestRun) -> str:
+    """What a run's fresh values are derived from.
+
+    The creation time is part of it: run IDs restart when a database is
+    reset, and the target may still hold what the earlier run 1 created.
+    """
+    created = test_run.created_at.isoformat() if test_run.created_at else ""
+    return f"run:{test_run.pk}:{created}"
+
+
+def _routes(test_run: TestRun) -> dict[tuple[str, str], Endpoint]:
+    """Every operation of the run's API, by method and path.
+
+    The whole document, not just the run's selection: reading back or
+    deleting what a create made may use an operation the run does not test.
+    """
+    return {(e.method, e.path): e for e in test_run.specification.endpoints.all()}
+
+
+def _item_route(
+    routes: dict[tuple[str, str], Endpoint], collection: str, method: str
+) -> tuple[Endpoint, str] | None:
+    """The ``{collection}/{id}`` operation for a method, and its ID parameter."""
+    prefix = collection.rstrip("/") + "/"
+    for (route_method, path), endpoint in sorted(routes.items()):
+        if route_method != method or not path.startswith(prefix):
+            continue
+        match = re.fullmatch(r"\{([^{}/]+)\}", path[len(prefix) :])
+        if match:
+            return endpoint, match.group(1)
+    return None
+
+
+_ITEM_PATH = re.compile(r"^(?P<collection>.+)/\{(?P<parameter>[^{}/]+)\}$")
+
+
+def _collection_route(
+    routes: dict[tuple[str, str], Endpoint], path: str
+) -> tuple[Endpoint, str] | None:
+    """The POST that creates what ``{collection}/{id}`` addresses, and the ID
+    parameter's name. The inverse of :func:`_item_route`."""
+    match = _ITEM_PATH.fullmatch(path)
+    if match is None:
+        return None
+    creator = routes.get(("POST", match.group("collection")))
+    if creator is None:
+        return None
+    return creator, match.group("parameter")
 
 
 # --- Executing a run ----------------------------------------------------------
@@ -722,7 +788,7 @@ def execute_test_run(
     Each case is committed as soon as it is judged, so progress is visible
     while the run is under way and a crash loses only the case in flight. A
     case whose request fails does not stop the run; a target that cannot be
-    reached at all does.
+    reached at all does. A run marked for cleanup then deletes what it created.
     """
     if test_run.status != TestRunStatus.RUNNING:
         raise DomainError(f"Only a running run can be executed; this one is '{test_run.status}'.")
@@ -741,13 +807,20 @@ def execute_test_run(
             _fail_run(test_run, problem)
             return summary
 
+        context = _RunContext(
+            test_run=test_run,
+            client=client,
+            seed=run_seed(test_run),
+            routes=_routes(test_run),
+            document=test_run.specification.raw_specification,
+        )
         cases = test_run.test_cases.filter(status=TestCaseStatus.PENDING).select_related(
             "endpoint"
         )
         unreachable = 0
         reached = False
         for test_case in cases.order_by("id").iterator():
-            result, findings = _execute_case(test_run, test_case, client)
+            result, findings = _execute_case(context, test_case)
             _tally(summary, test_case)
             summary.findings += findings
 
@@ -766,6 +839,8 @@ def execute_test_run(
                     )
                     return summary
 
+        if test_run.cleanup:
+            cleanup_test_run(test_run=test_run, client=client)
         complete_test_run(test_run)
     except Exception as exc:
         _fail_run(test_run, f"Execution stopped unexpectedly: {exc}")
@@ -777,71 +852,854 @@ def execute_test_run(
     return summary
 
 
-def _execute_case(
-    test_run: TestRun, test_case: TestCase, client: httpx.Client
-) -> tuple[executor.ExecutionResult, int]:
-    """Send one case, record the evidence, judge it. Returns the result and
-    the number of findings it produced."""
-    endpoint = test_case.endpoint
+@dataclass
+class _RunContext:
+    """What every case of one execution pass shares."""
+
+    test_run: TestRun
+    client: httpx.Client
+    seed: str
+    routes: dict[tuple[str, str], Endpoint]
+    document: Any
+    _codes: dict[int, list[str]] = field(default_factory=dict)
+
+    def documented(self, endpoint: Endpoint) -> list[str]:
+        if endpoint.pk not in self._codes:
+            self._codes[endpoint.pk] = openapi.documented_status_codes(
+                self.document, endpoint.path, endpoint.method
+            )
+        return self._codes[endpoint.pk]
+
+
+@dataclass
+class _Exchange:
+    """One request a case sent, and what came back."""
+
+    endpoint: Endpoint
+    step: str
+    prepared: executor.PreparedRequest
+    result: executor.ExecutionResult
+
+    @property
+    def status(self) -> int | None:
+        return self.result.status_code
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status is not None and 200 <= self.status < 300
+
+
+@dataclass
+class _Judged:
+    """A finding, the exchange it is about, and the exchanges that reproduce it."""
+
+    draft: evaluation.FindingDraft
+    exchange: int
+    steps: list[tuple[int, str]]
+
+
+@dataclass
+class _Outcome:
+    exchanges: list[_Exchange]
+    status: str
+    detail: str
+    findings: list[_Judged] = field(default_factory=list)
+
+
+def _send(
+    context: _RunContext, endpoint: Endpoint, input_data: dict[str, Any], step: str
+) -> _Exchange:
     prepared = executor.prepare(
         method=endpoint.method,
         path=endpoint.path,
-        input_data=test_case.input_data if isinstance(test_case.input_data, dict) else {},
-        base_url=test_run.base_url,
-        run_headers=test_run.headers,
+        input_data=input_data,
+        base_url=context.test_run.base_url,
+        run_headers=context.test_run.headers,
     )
     result = executor.send(
-        prepared, client=client, max_response_bytes=settings.EXECUTOR_MAX_RESPONSE_BYTES
+        prepared, client=context.client, max_response_bytes=settings.EXECUTOR_MAX_RESPONSE_BYTES
+    )
+    return _Exchange(endpoint=endpoint, step=step, prepared=prepared, result=result)
+
+
+def _execute_case(
+    context: _RunContext, test_case: TestCase
+) -> tuple[executor.ExecutionResult, int]:
+    """Send one case's requests, record the evidence, judge it. Returns the
+    last result and the number of findings it produced."""
+    if test_case.test_type == TestCaseType.DUPLICATE_CREATE:
+        outcome = _duplicate_create(context, test_case)
+    elif test_case.test_type == TestCaseType.CREATE_READ_BACK:
+        outcome = _create_read_back(context, test_case)
+    elif _needs_own_resource(test_case):
+        outcome = _item_case(context, test_case)
+    elif (unsafe := _unsafe_id_case(test_case)) is not None:
+        outcome = _skipped(unsafe)
+    else:
+        outcome = _single_request(context, test_case)
+    findings = _record(context, test_case, outcome)
+    last = outcome.exchanges[-1].result if outcome.exchanges else executor.ExecutionResult()
+    return last, findings
+
+
+def _input(test_case: TestCase) -> dict[str, Any]:
+    return test_case.input_data if isinstance(test_case.input_data, dict) else {}
+
+
+def _label(endpoint: Endpoint) -> str:
+    return f"{endpoint.method} {endpoint.path}"
+
+
+def _no_response(exchanges: list[_Exchange]) -> _Outcome:
+    return _Outcome(exchanges, TestCaseStatus.ERROR, exchanges[-1].result.error)
+
+
+_SEMANTIC_TYPES = {TestCaseType.CROSS_FIELD, TestCaseType.SUSPICIOUS_VALUE}
+# Methods that change the record their path names. Never sent to a guessed ID.
+_MUTATING_METHODS = {"PUT", "PATCH", "DELETE"}
+# How many more times a request that collided with existing data is sent with
+# fresh values before the collision is accepted as the answer. Fresh values are
+# drawn from a span the schema bounds (a year range allows about a hundred), so
+# one retry can collide again; three make that vanishingly rare.
+_COLLISION_RETRIES = 3
+# Methods whose ``{collection}/{id}`` happy path is sent to a resource the case
+# creates first, instead of to a sample ID. A mutating method's other cases
+# go the same way; a GET's other cases are read-only and keep the sample.
+_ITEM_METHODS = {"GET", "DELETE", "PUT", "PATCH"}
+
+
+def _guessed_path(test_case: TestCase, input_data: dict[str, Any]) -> bool:
+    """Whether the request's path values are generated samples that may name
+    nothing. A case that deliberately breaks a path parameter is not guessing."""
+    if not input_data.get("path"):
+        return False
+    target = test_case.name.split(":", 2)[1] if ":" in test_case.name else ""
+    return not target.startswith("path.")
+
+
+def _retry_input(
+    context: _RunContext, test_case: TestCase, attempt: int
+) -> dict[str, Any] | None:
+    """The same case on values the target has not seen, for one more attempt
+    after a collision. A happy path has every free-text field freshened; a
+    semantic case is rebuilt, so the relation it tests survives the retry."""
+    endpoint = test_case.endpoint
+    if test_case.test_type == TestCaseType.HAPPY_PATH:
+        return semantic.refreshed_input(
+            _input(test_case),
+            endpoint.request_schema,
+            _retry_token(context, test_case, attempt),
+        )
+    if test_case.test_type in _SEMANTIC_TYPES:
+        expected = generator.ExpectedStatus.from_codes(context.documented(endpoint))
+        return semantic.retry_input(
+            endpoint,
+            expected=expected,
+            seed=context.seed,
+            case_name=test_case.name,
+            attempt=attempt,
+        )
+    return None
+
+
+def _retry_token(context: _RunContext, test_case: TestCase, attempt: int) -> str:
+    return semantic.token_for(
+        context.seed, _label(test_case.endpoint), test_case.name, f"retry{attempt}"
     )
 
-    findings = 0
-    with transaction.atomic():
-        request_record = RequestRecord.objects.create(
-            test_case=test_case,
-            method=prepared.method,
-            url=prepared.url[: RequestRecord._meta.get_field("url").max_length],
-            headers=executor.redact_headers(prepared.headers),
-            query_params=prepared.query_params,
-            path_params=prepared.path_params,
-            body=prepared.body,
-            error=result.error,
+
+def _single_request(context: _RunContext, test_case: TestCase) -> _Outcome:
+    """A case that is one request — unless it collides with data already in
+    the target, in which case it is sent once more with fresh values."""
+    endpoint = test_case.endpoint
+    label = _label(endpoint)
+    input_data = _input(test_case)
+    happy = test_case.test_type == TestCaseType.HAPPY_PATH
+
+    exchanges = [_send(context, endpoint, input_data, "Send the request")]
+    first = exchanges[0]
+    if first.status is None:
+        return _no_response(exchanges)
+
+    judged: list[_Judged] = []
+    decisive = 0
+    conflict = oracles.is_conflict(first.status, first.result.body)
+    if conflict:
+        note = evaluation.undocumented_conflict(label, first.status, context.documented(endpoint))
+        if note is not None:
+            judged.append(_Judged(note, 0, [(0, "")]))
+
+    if conflict:
+        for attempt in range(1, _COLLISION_RETRIES + 1):
+            retry = _retry_input(context, test_case, attempt)
+            if retry is None:
+                break
+            exchanges.append(_send(context, endpoint, retry, "Send again with fresh values"))
+            latest = exchanges[-1]
+            if latest.status is None:
+                return _no_response(exchanges)
+            decisive = len(exchanges) - 1
+            if not oracles.is_conflict(latest.status, latest.result.body):
+                break
+    elif happy and first.status >= 500:
+        retry = _retry_input(context, test_case, 1)
+        if retry is not None:
+            exchanges.append(_send(context, endpoint, retry, "Send again with fresh values"))
+            second = exchanges[1]
+            if second.status is None:
+                return _no_response(exchanges)
+            if second.succeeded:
+                # The crash was about the values, not the request: they exist.
+                crash = evaluation.collision_crash(label, first.status, second.status)
+                return _Outcome(
+                    exchanges,
+                    TestCaseStatus.FAILED,
+                    f"{first.status} with the example values; {second.status} with fresh ones.",
+                    [_Judged(crash, 0, [(0, "These values already exist in the target.")])],
+                )
+
+    current = exchanges[decisive]
+    verdict = evaluation.evaluate(
+        label=label,
+        case_name=test_case.name,
+        test_type=test_case.test_type,
+        expected_status_code=test_case.expected_status_code,
+        status_code=current.status,
+        body=current.result.body,
+        oracle=test_case.oracle if isinstance(test_case.oracle, dict) else None,
+        guessed_path=_guessed_path(test_case, input_data),
+    )
+    status, detail = verdict.status, verdict.detail
+    if decisive:
+        attempts = "sent again" if decisive == 1 else f"sent {decisive} more times"
+        detail = (
+            f"The first attempt collided with existing data ({first.status}); "
+            f"{attempts} with fresh values: {detail}"
+        )
+    judged += [_Judged(draft, decisive, [(decisive, "")]) for draft in verdict.findings]
+
+    checked = {TestCaseType.HAPPY_PATH, TestCaseType.CROSS_FIELD, TestCaseType.SUSPICIOUS_VALUE}
+    if current.succeeded and test_case.test_type in checked:
+        drafts = _response_findings(context, endpoint, current)
+        judged += [_Judged(draft, decisive, [(decisive, "")]) for draft in drafts]
+        if drafts and status == TestCaseStatus.PASSED:
+            status = TestCaseStatus.FAILED
+            detail += " " + " ".join(draft.title + "." for draft in drafts)
+
+    return _Outcome(exchanges, status, detail, judged)
+
+
+def _response_findings(
+    context: _RunContext, endpoint: Endpoint, exchange: _Exchange
+) -> list[evaluation.FindingDraft]:
+    success = generator.ExpectedStatus.from_codes(context.documented(endpoint)).success
+    return evaluation.response_findings(
+        _label(endpoint),
+        sent=exchange.prepared.body,
+        received=exchange.result.body,
+        # The stored schema describes the lowest documented 2xx only.
+        response_schema=endpoint.response_schema if exchange.status == success else None,
+        check_echo=endpoint.method in {"POST", "PUT", "PATCH"},
+    )
+
+
+def _create(
+    context: _RunContext,
+    endpoint: Endpoint,
+    input_data: dict[str, Any],
+    exchanges: list[_Exchange],
+    test_case: TestCase,
+) -> _Exchange | None:
+    """The setup create of a sequence, sent again with fresh values while it
+    collides with existing data. None when it did not succeed."""
+    exchanges.append(_send(context, endpoint, input_data, "Create the resource"))
+    created = exchanges[-1]
+    for attempt in range(1, _COLLISION_RETRIES + 1):
+        if not oracles.is_conflict(created.status, created.result.body):
+            break
+        retry = semantic.refreshed_input(
+            input_data, endpoint.request_schema, _retry_token(context, test_case, attempt)
+        )
+        if retry is None:
+            break
+        exchanges.append(_send(context, endpoint, retry, "Create the resource"))
+        created = exchanges[-1]
+    return created if created.succeeded else None
+
+
+def _setup_failed(exchanges: list[_Exchange], purpose: str = "the sequence") -> _Outcome:
+    last = exchanges[-1]
+    if last.status is None:
+        return _no_response(exchanges)
+    return _Outcome(
+        exchanges,
+        TestCaseStatus.ERROR,
+        f"The setup create ({_label(last.endpoint)}) answered {last.status}, so {purpose} "
+        f"could not continue. That operation's own happy path reports on the create.",
+    )
+
+
+def _duplicate_create(context: _RunContext, test_case: TestCase) -> _Outcome:
+    """Create a resource, then send exactly the same create again."""
+    endpoint = test_case.endpoint
+    label = _label(endpoint)
+    exchanges: list[_Exchange] = []
+    created = _create(context, endpoint, _input(test_case), exchanges, test_case)
+    if created is None:
+        return _setup_failed(exchanges)
+    first = len(exchanges) - 1
+
+    body = created.prepared.body
+    input_data = {**_input(test_case), "body": body}
+    exchanges.append(_send(context, endpoint, input_data, "Send the identical create again"))
+    second = exchanges[-1]
+    if second.status is None:
+        return _no_response(exchanges)
+
+    verdict = evaluation.duplicate_create(label, created.status, second.status, second.result.body)
+    steps = [(first, "Setup: create the resource."), (len(exchanges) - 1, "Send the same request again.")]
+    judged = [_Judged(draft, len(exchanges) - 1, steps) for draft in verdict.findings]
+    if oracles.is_conflict(second.status, second.result.body):
+        note = evaluation.undocumented_conflict(label, second.status, context.documented(endpoint))
+        if note is not None:
+            judged.append(_Judged(note, len(exchanges) - 1, steps))
+    return _Outcome(exchanges, verdict.status, verdict.detail, judged)
+
+
+def _create_read_back(context: _RunContext, test_case: TestCase) -> _Outcome:
+    """Create a resource, then find it again by ID, or else in the list."""
+    endpoint = test_case.endpoint
+    label = _label(endpoint)
+    exchanges: list[_Exchange] = []
+    created = _create(context, endpoint, _input(test_case), exchanges, test_case)
+    if created is None:
+        return _setup_failed(exchanges)
+    create_index = len(exchanges) - 1
+
+    sent = created.prepared.body
+    path_values = dict(created.prepared.path_params)
+    item = _item_route(context.routes, endpoint.path, "GET")
+    identifier = oracles.resource_id(created.result.body, item[1] if item else None)
+    collection = context.routes.get(("GET", endpoint.path))
+
+    if item is not None and identifier is not None:
+        reader, parameter = item
+        read_input = _read_input(reader, {**path_values, parameter: identifier})
+        exchanges.append(_send(context, reader, read_input, "Read it back by ID"))
+        read = exchanges[-1]
+        if read.status is None:
+            return _no_response(exchanges)
+        found = read.succeeded
+        verdict = evaluation.read_back(
+            label,
+            how=_label(reader),
+            status_code=read.status,
+            found=found,
+            mismatches=oracles.echo_mismatches(sent, read.result.body) if found else [],
+            identifier=identifier,
+        )
+    elif collection is not None:
+        exchanges.append(
+            _send(context, collection, _read_input(collection, path_values), "List the resources")
+        )
+        read = exchanges[-1]
+        if read.status is None:
+            return _no_response(exchanges)
+        items = oracles.list_items(read.result.body) if read.succeeded else None
+        if read.status < 500 and items is None:
+            return _Outcome(
+                exchanges,
+                TestCaseStatus.ERROR,
+                f"The list answered {read.status} with a body AegisTest could not read as a "
+                f"list, so the created resource could not be looked for.",
+            )
+        match = oracles.find_created(items or [], identifier, sent)
+        verdict = evaluation.read_back(
+            label,
+            how=_label(collection),
+            status_code=read.status,
+            found=match is not None,
+            mismatches=oracles.echo_mismatches(sent, match) if match is not None else [],
+            identifier=identifier,
+            uncertain=len(items or []) >= 10 or not isinstance(read.result.body, list),
+        )
+    else:
+        return _Outcome(
+            exchanges,
+            TestCaseStatus.ERROR,
+            "The create response carries no ID, and the API has no list to look in.",
         )
 
-        if result.status_code is None:
-            test_case.status = TestCaseStatus.ERROR
-            test_case.status_detail = result.error
-        else:
-            response_record = ResponseRecord.objects.create(
-                request_record=request_record,
-                status_code=result.status_code,
-                headers=executor.redact_headers(result.headers),
-                body=result.body,
-                response_time_ms=result.response_time_ms,
-            )
-            verdict = evaluation.evaluate(
-                label=f"{endpoint.method} {endpoint.path}",
-                case_name=test_case.name,
-                test_type=test_case.test_type,
-                expected_status_code=test_case.expected_status_code,
-                status_code=result.status_code,
-            )
-            test_case.status = verdict.status
-            test_case.status_detail = verdict.detail
-            for draft in verdict.findings:
-                Finding.objects.create(
-                    test_case=test_case,
-                    response_record=response_record,
-                    title=draft.title[: Finding._meta.get_field("title").max_length],
-                    description=draft.description,
-                    severity=draft.severity,
-                    category=draft.category,
-                    evidence=_evidence(test_case, prepared, result),
-                )
-                findings += 1
+    steps = [(create_index, "Setup: create the resource."), (len(exchanges) - 1, "Read it back.")]
+    judged = [_Judged(draft, len(exchanges) - 1, steps) for draft in verdict.findings]
+    return _Outcome(exchanges, verdict.status, verdict.detail, judged)
 
+
+def _case_target(test_case: TestCase) -> str:
+    """The parameter or field a generated case breaks: ``path.id``, ``query.limit``,
+    ``name``; empty for a happy path or a sequence."""
+    return test_case.name.split(":", 2)[1] if ":" in test_case.name else ""
+
+
+def _needs_own_resource(test_case: TestCase) -> bool:
+    """Whether a case on ``{collection}/{id}`` must address a resource of its own.
+
+    Every case of a PUT, PATCH or DELETE does: sent to the sample ID it would
+    change or remove a record the run did not create. A GET only needs one for
+    its happy path; its other cases are read-only. The exception is a case
+    that breaks the ID parameter itself: that value is the test.
+    """
+    endpoint = test_case.endpoint
+    if endpoint.method not in _ITEM_METHODS:
+        return False
+    match = _ITEM_PATH.fullmatch(endpoint.path)
+    if match is None:
+        return False
+    if _case_target(test_case) == f"path.{match.group('parameter')}":
+        return False
+    if endpoint.method in _MUTATING_METHODS:
+        return True
+    return test_case.test_type == TestCaseType.HAPPY_PATH
+
+
+def _names_a_record(value: Any) -> bool:
+    """Whether a path value could address an existing record: a number, or
+    text made of digits. ``"not-an-integer"`` cannot."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    return isinstance(value, str) and value.strip().isdigit()
+
+
+def _unsafe_id_case(test_case: TestCase) -> str | None:
+    """Why a mutating case that breaks the ID parameter must not be sent, or None.
+
+    ``invalid_type:path.id`` sends text where a number is required and cannot
+    reach a record; ``below_minimum:path.id`` sends a number that may well be
+    one, and a PUT or DELETE to it would change data the run does not own.
+    """
+    endpoint = test_case.endpoint
+    if endpoint.method not in _MUTATING_METHODS:
+        return None
+    match = _ITEM_PATH.fullmatch(endpoint.path)
+    if match is None or _case_target(test_case) != f"path.{match.group('parameter')}":
+        return None
+    value = (_input(test_case).get("path") or {}).get(match.group("parameter"))
+    if not _names_a_record(value):
+        return None
+    return (
+        f"Not sent: the case breaks the '{match.group('parameter')}' path parameter with "
+        f"{value!r}, which may name a real record, and a {endpoint.method} to it would change "
+        f"data the run did not create."
+    )
+
+
+def _skipped(reason: str) -> _Outcome:
+    return _Outcome([], TestCaseStatus.SKIPPED, reason)
+
+
+def _owned(exchange: _Exchange) -> bool:
+    """Whether a create's answer proves the record is the run's own to change
+    or delete. Only a 201 does: a 200 may be an existing record returned by an
+    upsert or a find-or-create."""
+    return exchange.status == 201
+
+
+def _setup_input(context: _RunContext, creator: Endpoint, test_case: TestCase) -> dict[str, Any] | None:
+    """A valid create request for ``creator``, with values of this case's own."""
+    expected = generator.ExpectedStatus.from_codes(context.documented(creator))
+    generated = semantic.build_test_cases(
+        creator,
+        expected=expected,
+        seed=semantic.token_for(context.seed, _label(test_case.endpoint), test_case.name, "setup"),
+        readable=False,
+    )
+    for definition in generated.definitions:
+        if definition.test_type == TestCaseType.HAPPY_PATH:
+            return deepcopy(definition.input_data)
+    return None
+
+
+def _item_case(context: _RunContext, test_case: TestCase) -> _Outcome:
+    """A case on one resource, sent to a resource the case creates first.
+
+    The generated path value is a sample (``id: 1``) that may name nothing —
+    or somebody's data, which a DELETE would remove and a PUT would overwrite.
+    Creating a resource first makes the request about something that exists
+    and belongs to the run, so its answer is a verdict rather than a guess,
+    and the case keeps whatever it deliberately breaks: an invalid body, a
+    bad query parameter, a wrong-typed parent ID.
+
+    A mutating case with nothing disposable to address is skipped, never sent
+    to the sample. A create that fails, or answers without an ID, leaves the
+    case unjudged: an ID is never guessed.
+    """
+    endpoint = test_case.endpoint
+    label = _label(endpoint)
+    input_data = _input(test_case)
+    mutating = endpoint.method in _MUTATING_METHODS
+    parameter = _ITEM_PATH.fullmatch(endpoint.path).group("parameter")
+    found = _collection_route(context.routes, endpoint.path)
+    creator = found[0] if found is not None else None
+
+    if creator is None:
+        if mutating:
+            return _skipped(
+                f"Not sent: the document has no POST {endpoint.path.rsplit('/', 1)[0]} to "
+                f"create a disposable record, and a {endpoint.method} to the sample ID would "
+                f"change a record the run did not create."
+            )
+        return _single_request(context, test_case)
+    setup = _setup_input(context, creator, test_case)
+    if setup is None:
+        if mutating:
+            return _skipped(
+                f"Not sent: no valid request to {_label(creator)} can be built from the "
+                f"document, so there is no disposable record for this {endpoint.method}."
+            )
+        return _single_request(context, test_case)
+
+    exchanges: list[_Exchange] = []
+    created = _create(context, creator, setup, exchanges, test_case)
+    if created is None:
+        return _setup_failed(exchanges, f"the {endpoint.method} of a created resource")
+    create_index = len(exchanges) - 1
+    if mutating and not _owned(created):
+        return _Outcome(
+            exchanges,
+            TestCaseStatus.SKIPPED,
+            f"Not sent: the create ({_label(creator)}) answered {created.status} rather than "
+            f"201, so the record it returned may have existed already and is not the run's "
+            f"to {endpoint.method.lower()}.",
+        )
+
+    identifier = oracles.resource_id(created.result.body, parameter)
+    if identifier is None:
+        return _Outcome(
+            exchanges,
+            TestCaseStatus.ERROR,
+            f"The create ({_label(creator)}) answered {created.status}, but its response "
+            f"carries no ID (looked for '{parameter}', 'id', '_id' and 'uuid'), so the new "
+            f"resource cannot be addressed and the case could not be judged.",
+        )
+
+    # The case's own path values win over the create's, so a case that breaks a
+    # parent parameter still breaks it; only the ID is the created record's.
+    path_values = {
+        **created.prepared.path_params,
+        **dict(input_data.get("path") or {}),
+        parameter: identifier,
+    }
+    request = {**input_data, "path": path_values}
+    exchanges.append(_send(context, endpoint, request, f"{endpoint.method} it"))
+    current = exchanges[-1]
+    if current.status is None:
+        return _no_response(exchanges)
+
+    # Fresh body values while the request under test collides with other data.
+    retryable = test_case.test_type == TestCaseType.HAPPY_PATH or test_case.test_type in _SEMANTIC_TYPES
+    attempts = 0
+    while retryable and oracles.is_conflict(current.status, current.result.body) and attempts < _COLLISION_RETRIES:
+        attempts += 1
+        retry = _retry_input(context, test_case, attempts)
+        if retry is None:
+            break
+        exchanges.append(
+            _send(context, endpoint, {**retry, "path": path_values}, "Send again with fresh values")
+        )
+        current = exchanges[-1]
+        if current.status is None:
+            return _no_response(exchanges)
+    index = len(exchanges) - 1
+    steps = [(create_index, "Setup: create the resource."), (index, "")]
+
+    verdict = evaluation.evaluate(
+        label=label,
+        case_name=test_case.name,
+        test_type=test_case.test_type,
+        expected_status_code=test_case.expected_status_code,
+        status_code=current.status,
+        body=current.result.body,
+        oracle=test_case.oracle if isinstance(test_case.oracle, dict) else None,
+        created_resource=True,
+    )
+    status, detail = verdict.status, verdict.detail
+    if attempts:
+        detail = (
+            f"The first attempt collided with existing data ({exchanges[create_index + 1].status}); "
+            f"sent again with fresh values: {detail}"
+        )
+    judged = [_Judged(draft, index, steps) for draft in verdict.findings]
+
+    checked = {TestCaseType.HAPPY_PATH, *_SEMANTIC_TYPES}
+    if current.succeeded and test_case.test_type in checked:
+        drafts = _response_findings(context, endpoint, current)
+        judged += [_Judged(draft, index, steps) for draft in drafts]
+        if drafts and status == TestCaseStatus.PASSED:
+            status = TestCaseStatus.FAILED
+            detail += " " + " ".join(draft.title + "." for draft in drafts)
+
+    reader = _item_route(context.routes, creator.path, "GET")
+    if endpoint.method == "DELETE" and current.succeeded and reader is not None:
+        reader_endpoint, reader_parameter = reader
+        exchanges.append(
+            _send(
+                context,
+                reader_endpoint,
+                _read_input(reader_endpoint, {**path_values, reader_parameter: identifier}),
+                "Read it back after the delete",
+            )
+        )
+        after = exchanges[-1]
+        if after.status is None:
+            return _no_response(exchanges)
+        gone = evaluation.deleted_read_back(
+            label, how=_label(reader_endpoint), status_code=after.status, identifier=identifier
+        )
+        after_steps = steps + [(len(exchanges) - 1, "Read it back after the delete.")]
+        judged += [_Judged(draft, len(exchanges) - 1, after_steps) for draft in gone.findings]
+        if gone.status != TestCaseStatus.PASSED and status == TestCaseStatus.PASSED:
+            status = gone.status
+        detail += " " + gone.detail
+
+    return _Outcome(exchanges, status, detail, judged)
+
+
+def _read_input(reader: Endpoint, path_values: dict[str, Any]) -> dict[str, Any]:
+    """A valid request to a GET, with the given path values."""
+    generated = generator.generate_test_cases(reader)
+    base = generated.definitions[0].input_data if not generated.is_empty else {}
+    names = {
+        p.get("name") for p in reader.parameters or [] if isinstance(p, dict) and p.get("in") == "path"
+    }
+    return {
+        "path": {name: value for name, value in path_values.items() if name in names},
+        "query": dict(base.get("query") or {}),
+        "headers": dict(base.get("headers") or {}),
+        "body": None,
+    }
+
+
+def _record(context: _RunContext, test_case: TestCase, outcome: _Outcome) -> int:
+    """Store a case's requests, responses, findings and created resources."""
+    findings = 0
+    with transaction.atomic():
+        responses: list[ResponseRecord | None] = []
+        for exchange in outcome.exchanges:
+            request_record = RequestRecord.objects.create(
+                test_case=test_case,
+                method=exchange.prepared.method,
+                url=exchange.prepared.url[: RequestRecord._meta.get_field("url").max_length],
+                headers=executor.redact_headers(exchange.prepared.headers),
+                query_params=exchange.prepared.query_params,
+                path_params=exchange.prepared.path_params,
+                body=exchange.prepared.body,
+                error=exchange.result.error,
+            )
+            response_record = None
+            if exchange.status is not None:
+                response_record = ResponseRecord.objects.create(
+                    request_record=request_record,
+                    status_code=exchange.status,
+                    headers=executor.redact_headers(exchange.result.headers),
+                    body=exchange.result.body,
+                    response_time_ms=exchange.result.response_time_ms,
+                )
+                _track_created(context, test_case, exchange)
+                _mark_deleted(context, test_case, exchange)
+            responses.append(response_record)
+
+        for judged in outcome.findings:
+            draft = judged.draft
+            if not draft.fails_case and _already_noted(test_case, draft):
+                continue
+            exchange = outcome.exchanges[judged.exchange]
+            Finding.objects.create(
+                test_case=test_case,
+                response_record=responses[judged.exchange],
+                title=draft.title[: Finding._meta.get_field("title").max_length],
+                description=draft.description,
+                severity=draft.severity,
+                category=draft.category,
+                confidence=draft.confidence,
+                probable_cause=draft.probable_cause[
+                    : Finding._meta.get_field("probable_cause").max_length
+                ],
+                reproduction=[
+                    _reproduction_step(number, outcome.exchanges[index], note)
+                    for number, (index, note) in enumerate(judged.steps, start=1)
+                ],
+                evidence=_evidence(test_case, exchange.prepared, exchange.result),
+            )
+            findings += 1
+
+        test_case.status = outcome.status
+        test_case.status_detail = outcome.detail
         test_case.save(update_fields=["status", "status_detail", "updated_at"])
 
-    return result, findings
+    return findings
+
+
+def _already_noted(test_case: TestCase, draft: evaluation.FindingDraft) -> bool:
+    """A documentation note is made once per operation, not once per case."""
+    return Finding.objects.filter(
+        test_case__test_run_id=test_case.test_run_id,
+        test_case__endpoint_id=test_case.endpoint_id,
+        title=draft.title[: Finding._meta.get_field("title").max_length],
+    ).exists()
+
+
+def _reproduction_step(number: int, exchange: _Exchange, note: str) -> dict[str, Any]:
+    prepared = exchange.prepared
+    return {
+        "step": number,
+        "note": note,
+        "method": prepared.method,
+        "url": prepared.url,
+        "query": prepared.query_params,
+        "body": prepared.body,
+        "status_code": exchange.status,
+    }
+
+
+def _track_created(context: _RunContext, test_case: TestCase, exchange: _Exchange) -> None:
+    """Remember a resource a successful create made, and how to delete it.
+
+    Only a 201 proves the record is new. A POST documented as a create that
+    answers 200 is recorded without a delete URL: it may be an upsert or a
+    find-or-create handing back a record that existed, which cleanup must not
+    remove. Any other 2xx is not a create at all - a search, an action.
+    """
+    if exchange.prepared.method != "POST" or not exchange.succeeded:
+        return
+    route = _item_route(context.routes, exchange.endpoint.path, "DELETE")
+    identifier = oracles.resource_id(exchange.result.body, route[1] if route else None)
+    documented_create = (
+        generator.ExpectedStatus.from_codes(context.documented(exchange.endpoint)).success == 201
+    )
+    if not _owned(exchange) and not (documented_create and identifier is not None):
+        return
+
+    delete_url = ""
+    detail = ""
+    if not _owned(exchange):
+        detail = (
+            f"The create answered {exchange.status} rather than 201, so this may be a record "
+            f"that existed already; it is not deleted automatically."
+        )
+    elif identifier is None:
+        detail = "The create response carried no ID, so it cannot be deleted automatically."
+    elif route is None:
+        detail = "The API documents no DELETE for this resource."
+    else:
+        remover, parameter = route
+        delete_url = executor.prepare(
+            method="DELETE",
+            path=remover.path,
+            input_data={"path": {**exchange.prepared.path_params, parameter: identifier}},
+            base_url=context.test_run.base_url,
+        ).url
+    CreatedResource.objects.create(
+        test_run=context.test_run,
+        test_case=test_case,
+        endpoint=exchange.endpoint,
+        resource_id=identifier or "",
+        delete_url=delete_url[: CreatedResource._meta.get_field("delete_url").max_length],
+        detail=detail,
+    )
+
+
+def _mark_deleted(context: _RunContext, test_case: TestCase, exchange: _Exchange) -> None:
+    """A DELETE the run sent itself takes the resource off the cleanup list."""
+    if exchange.prepared.method != "DELETE" or not exchange.succeeded:
+        return
+    CreatedResource.objects.filter(
+        test_run=context.test_run,
+        delete_url=exchange.prepared.url[: CreatedResource._meta.get_field("delete_url").max_length],
+    ).exclude(status=ResourceStatus.DELETED).update(
+        status=ResourceStatus.DELETED,
+        detail=f"Deleted by the run's own '{test_case.name}' case ({exchange.status}).",
+        updated_at=timezone.now(),
+    )
+
+
+# --- Cleaning up ----------------------------------------------------------------
+
+
+@dataclass
+class CleanupSummary:
+    deleted: int = 0
+    failed: int = 0
+    left: int = 0
+
+
+def cleanup_test_run(*, test_run: TestRun, client: httpx.Client | None = None) -> CleanupSummary:
+    """DELETE every resource the run created that can be deleted.
+
+    A 404 or 410 counts as deleted: the resource is gone either way. What
+    cannot be deleted — no ID, no DELETE operation, a refused DELETE — stays
+    listed as left behind.
+    """
+    problem = executor.base_url_problem(test_run.base_url, settings.EXECUTOR_ALLOWED_HOSTS)
+    if problem:
+        raise ValidationError({"base_url": problem})
+
+    owns_client = client is None
+    if client is None:
+        client = executor.make_client(
+            timeout=settings.EXECUTOR_TIMEOUT_SECONDS, verify_tls=settings.EXECUTOR_VERIFY_TLS
+        )
+    headers = {"Accept": "application/json"}
+    headers.update({str(k): str(v) for k, v in (test_run.headers or {}).items()})
+    try:
+        pending = test_run.created_resources.exclude(status=ResourceStatus.DELETED).exclude(
+            delete_url=""
+        )
+        for resource in pending.order_by("-id"):
+            result = executor.send(
+                executor.PreparedRequest(
+                    method="DELETE",
+                    url=resource.delete_url,
+                    headers=headers,
+                    query_params={},
+                    path_params={},
+                ),
+                client=client,
+                max_response_bytes=settings.EXECUTOR_MAX_RESPONSE_BYTES,
+            )
+            if result.status_code is not None and (
+                200 <= result.status_code < 300 or result.status_code in {404, 410}
+            ):
+                resource.status = ResourceStatus.DELETED
+                resource.detail = f"DELETE answered {result.status_code}."
+            else:
+                resource.status = ResourceStatus.DELETE_FAILED
+                resource.detail = (
+                    f"DELETE answered {result.status_code}."
+                    if result.status_code is not None
+                    else f"DELETE failed: {result.error}"
+                )
+            resource.save(update_fields=["status", "detail", "updated_at"])
+    finally:
+        if owns_client:
+            client.close()
+    return summarise_resources(test_run)
+
+
+def summarise_resources(test_run: TestRun) -> CleanupSummary:
+    counts = dict(
+        test_run.created_resources.order_by().values_list("status").annotate(n=models.Count("id"))
+    )
+    return CleanupSummary(
+        deleted=counts.get(ResourceStatus.DELETED, 0),
+        failed=counts.get(ResourceStatus.DELETE_FAILED, 0),
+        left=counts.get(ResourceStatus.LEFT, 0),
+    )
+
+
+def list_created_resources(*, test_run: TestRun) -> models.QuerySet[CreatedResource]:
+    return test_run.created_resources.select_related("endpoint")
 
 
 # Enough of a response body to see what the API said, without copying a large
@@ -891,6 +1749,8 @@ def _tally(summary: ExecutionSummary, test_case: TestCase) -> None:
         summary.passed += 1
     elif test_case.status == TestCaseStatus.FAILED:
         summary.failed += 1
+    elif test_case.status == TestCaseStatus.SKIPPED:
+        summary.skipped += 1
     else:
         summary.errors += 1
 
@@ -1712,6 +2572,11 @@ def _severity_rank(field_name: str) -> models.Case:
 # Findings printed in a report, most severe first. Every finding stays
 # available from the API; a PDF of thousands of pages helps nobody.
 _REPORT_MAX_FINDINGS = 300
+_REPORT_MAX_CASES = 500
+_REPORT_MAX_SEQUENCES = 60
+_REPORT_MAX_RESOURCES = 100
+_REPORT_MAX_NOT_TESTED = 40
+_REPORT_MAX_REASONS = 12
 
 
 def test_run_report_pdf(*, test_run: TestRun) -> bytes:
@@ -1736,6 +2601,30 @@ def test_run_report(*, test_run: TestRun) -> report.RunReport:
     if analysis is not None:
         assessments = {a.finding_id: a for a in analysis.assessments.all()}
 
+    test_cases = list(
+        test_run.test_cases.select_related("endpoint")
+        .prefetch_related("request_records__response")
+        .order_by("endpoint__path", "endpoint__method", "id")
+    )
+    cases, sequences = _report_cases(test_run, test_cases)
+    not_run = [
+        c for c in test_cases
+        if c.status in {TestCaseStatus.PENDING, TestCaseStatus.SKIPPED, TestCaseStatus.RUNNING}
+    ]
+    resources = list(list_created_resources(test_run=test_run))
+    # Operations this run executed nothing against, judged from this run's own
+    # cases: a case executed in an earlier run is no evidence for this one.
+    executed_endpoints = {
+        c.endpoint_id
+        for c in test_cases
+        if c.status in {TestCaseStatus.PASSED, TestCaseStatus.FAILED, TestCaseStatus.ERROR}
+    }
+    not_tested = list(
+        test_run.specification.endpoints.exclude(pk__in=executed_endpoints).order_by(
+            "path", "method"
+        )
+    )
+
     return report.RunReport(
         specification=str(test_run.specification),
         run_name=test_run.name,
@@ -1752,7 +2641,134 @@ def test_run_report(*, test_run: TestRun) -> report.RunReport:
         findings_total=findings_total,
         analysis=_report_analysis(analysis) if analysis is not None else None,
         scope=_scope_text(describe_scope(test_run)),
+        resources=[
+            report.ReportResource(
+                endpoint=f"{r.endpoint.method} {r.endpoint.path}",
+                resource_id=r.resource_id,
+                status=r.status,
+                detail=r.detail,
+            )
+            for r in resources[:_REPORT_MAX_RESOURCES]
+        ],
+        resources_total=len(resources),
+        cases=cases[:_REPORT_MAX_CASES],
+        cases_total=len(cases),
+        sequences=sequences[:_REPORT_MAX_SEQUENCES],
+        sequences_total=len(sequences),
+        not_tested=[f"{e.method} {e.path}" for e in not_tested[:_REPORT_MAX_NOT_TESTED]],
+        not_tested_total=len(not_tested),
+        not_run_reasons=_reasons(not_run),
+        inconclusive_reasons=_reasons(
+            [c for c in test_cases if c.status == TestCaseStatus.ERROR]
+        ),
     )
+
+
+def _report_cases(
+    test_run: TestRun, test_cases: list[TestCase]
+) -> tuple[list[report.ReportCase], list[report.ReportSequence]]:
+    """Every case of the run as the report shows it, and the multi-request ones
+    again as sequences. Request values are the ones sent, with secrets masked."""
+    finding_counts = dict(
+        Finding.objects.filter(test_case__test_run=test_run)
+        .values_list("test_case_id")
+        .annotate(n=models.Count("id"))
+    )
+    cases: list[report.ReportCase] = []
+    sequences: list[report.ReportSequence] = []
+    for test_case in test_cases:
+        label = f"{test_case.endpoint.method} {test_case.endpoint.path}"
+        records = list(test_case.request_records.all())
+        responses = [_response_of(r) for r in records]
+        # The request under test: the last one with the operation's own method
+        # (a sequence's setup create or read-back uses another), else the last.
+        decisive = next(
+            (i for i in range(len(records) - 1, -1, -1)
+             if records[i].method == test_case.endpoint.method),
+            len(records) - 1,
+        )
+        actual = responses[decisive].status_code if records and responses[decisive] else None
+        if records:
+            request = _request_text(
+                records[decisive].method, records[decisive].url, test_run.base_url,
+                records[decisive].query_params, records[decisive].body,
+            )
+        else:
+            input_data = _input(test_case)
+            request = _request_text(
+                test_case.endpoint.method, test_case.endpoint.path, "",
+                input_data.get("query"), input_data.get("body"),
+            )
+        cases.append(
+            report.ReportCase(
+                id=test_case.pk,
+                name=test_case.name,
+                endpoint=label,
+                test_type=test_case.test_type,
+                purpose=test_case.description,
+                request=request,
+                expected_status=test_case.expected_status_code,
+                actual_status=actual,
+                status=test_case.status,
+                detail=test_case.status_detail,
+                requests_sent=len(records),
+                findings=finding_counts.get(test_case.pk, 0),
+            )
+        )
+        if len(records) > 1:
+            sequences.append(
+                report.ReportSequence(
+                    case=test_case.name,
+                    endpoint=label,
+                    status=test_case.status,
+                    steps=[
+                        {
+                            "method": record.method,
+                            "url": _relative_url(record.url, test_run.base_url),
+                            "status_code": response.status_code if response else None,
+                            "note": record.error if response is None else "",
+                        }
+                        for record, response in zip(records, responses)
+                    ],
+                )
+            )
+    return cases, sequences
+
+
+def _response_of(record: RequestRecord) -> ResponseRecord | None:
+    try:
+        return record.response
+    except ResponseRecord.DoesNotExist:
+        return None
+
+
+def _relative_url(url: str, base_url: str) -> str:
+    return url[len(base_url):] if base_url and url.startswith(base_url) else url
+
+
+def _request_text(method: str, url: str, base_url: str, query: Any, body: Any) -> str:
+    """One line naming the request, then its query and body, secrets masked."""
+    text = f"{method} {_relative_url(url, base_url)}"
+    if isinstance(query, dict) and query:
+        text += "\nquery: " + json.dumps(executor.redact_body(query), ensure_ascii=False)
+    if body is not None:
+        rendered = (
+            body if isinstance(body, str)
+            else json.dumps(executor.redact_body(body), ensure_ascii=False)
+        )
+        text += "\nbody: " + rendered
+    return text
+
+
+def _reasons(test_cases: list[TestCase]) -> list[tuple[str, int]]:
+    """Cases grouped by the first sentence of their status detail, most common first."""
+    counts: dict[str, int] = {}
+    for test_case in test_cases:
+        reason = (test_case.status_detail or "no reason recorded").split(". ")[0].strip().rstrip(".")
+        reason = reason if len(reason) <= 140 else reason[:140] + "..."
+        counts[reason] = counts.get(reason, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return ordered[:_REPORT_MAX_REASONS]
 
 
 def _scope_text(scope: dict[str, Any]) -> str:
@@ -1785,6 +2801,8 @@ def _report_endpoints(test_run: TestRun) -> list[report.ReportEndpoint]:
             passed=count(TestCaseStatus.PASSED),
             failed=count(TestCaseStatus.FAILED),
             errors=count(TestCaseStatus.ERROR),
+            pending=count(TestCaseStatus.PENDING),
+            skipped=count(TestCaseStatus.SKIPPED),
             findings=models.Count(
                 "test_cases__findings",
                 filter=models.Q(test_cases__test_run=test_run),
@@ -1794,6 +2812,13 @@ def _report_endpoints(test_run: TestRun) -> list[report.ReportEndpoint]:
         .distinct()
         .order_by("path", "method")
     )
+    scenarios: dict[int, dict[str, int]] = {}
+    for endpoint_id, test_type in (
+        test_run.test_cases.order_by("test_type").values_list("endpoint_id", "test_type")
+    ):
+        label = report.scenario_label(test_type)
+        counts = scenarios.setdefault(endpoint_id, {})
+        counts[label] = counts.get(label, 0) + 1
     return [
         report.ReportEndpoint(
             label=f"{e.method} {e.path}",
@@ -1802,6 +2827,8 @@ def _report_endpoints(test_run: TestRun) -> list[report.ReportEndpoint]:
             failed=e.failed,
             errors=e.errors,
             findings=e.findings,
+            not_run=e.pending + e.skipped,
+            scenarios=scenarios.get(e.pk, {}),
         )
         for e in endpoints
     ]
@@ -1827,10 +2854,20 @@ def _report_finding(
         expected_status=test_case.expected_status_code,
         request_method=str(request.get("method") or ""),
         request_url=str(request.get("url") or ""),
-        request_body=request.get("body"),
+        request_body=executor.redact_body(request.get("body")),
         response_status=response.get("status_code"),
-        response_body=response.get("body"),
+        response_body=executor.redact_body(response.get("body")),
         response_time_ms=response.get("response_time_ms"),
+        confidence=finding.confidence,
+        probable_cause=finding.probable_cause,
+        reproduction=[
+            {**step, "body": executor.redact_body(step.get("body"))}
+            for step in finding.reproduction
+            if isinstance(step, dict)
+        ]
+        if isinstance(finding.reproduction, list)
+        else [],
+        status=finding.status,
         assessment=(
             report.ReportAssessment(
                 verdict=assessment.verdict,

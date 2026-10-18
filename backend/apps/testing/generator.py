@@ -136,6 +136,8 @@ class TestCaseDefinition:
     description: str
     input_data: dict[str, Any]
     expected_status_code: int | None = None
+    # For semantic cases: why accepting the request would be suspicious.
+    oracle: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -195,10 +197,10 @@ def generate_test_cases(
     if body_schema:
         definitions.extend(_body_cases(base, body_schema, label, expected, warnings))
 
-    return GeneratedTests(definitions=_named(definitions, warnings), warnings=warnings)
+    return GeneratedTests(definitions=keep_unique_names(definitions, warnings), warnings=warnings)
 
 
-def _named(
+def keep_unique_names(
     definitions: list[TestCaseDefinition], warnings: list[str]
 ) -> list[TestCaseDefinition]:
     """Keep names inside the column that stores them, and keep them unique."""
@@ -225,6 +227,7 @@ def _replace_name(definition: TestCaseDefinition, name: str) -> TestCaseDefiniti
         description=definition.description,
         input_data=definition.input_data,
         expected_status_code=definition.expected_status_code,
+        oracle=definition.oracle,
     )
 
 

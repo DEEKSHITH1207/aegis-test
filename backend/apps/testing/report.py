@@ -51,6 +51,121 @@ VERDICT_LABELS = {
     "uncertain": "Uncertain",
 }
 
+# The words the dashboard's tiles use for a case's status. "Error" is a case
+# that got no verdict - the request was refused, timed out, or collided with
+# existing data - and is inconclusive rather than a failure.
+STATUS_LABELS = {
+    "passed": "Passed",
+    "failed": "Failed",
+    "error": "Error",
+    "skipped": "Skipped",
+    "pending": "Not run",
+    "running": "Running",
+}
+# The same statuses as counts, worded as the dashboard's tiles word them.
+COUNT_LABELS = {**STATUS_LABELS, "error": "Errors"}
+
+# What a generated case is for, by its test_type, as a developer would name it.
+SCENARIO_LABELS = {
+    "happy_path": "Happy path",
+    "missing_required": "Required-field validation",
+    "empty_value": "Required-field validation",
+    "invalid_type": "Wrong type",
+    "invalid_format": "Malformed format",
+    "invalid_enum": "Value outside the enum",
+    "below_minimum": "Boundary value",
+    "above_maximum": "Boundary value",
+    "below_min_length": "Boundary value",
+    "above_max_length": "Boundary value",
+    "cross_field": "Semantic rule",
+    "suspicious_value": "Semantic rule",
+    "duplicate_create": "Duplicate create",
+    "create_read_back": "Create and read back",
+}
+
+# How findings are grouped on the page, in order. A spec gap is never a bug;
+# a low-confidence or low-severity defect is a possible issue; the triage
+# status a person set overrides the automatic grouping.
+FINDING_GROUPS = ("bug", "possible", "documentation", "inconclusive", "dismissed")
+GROUP_TITLES = {
+    "bug": "Bugs",
+    "possible": "Possible issues",
+    "documentation": "Documentation gaps",
+    "inconclusive": "Inconclusive",
+    "dismissed": "Dismissed as false positives",
+}
+GROUP_INTROS = {
+    "bug": (
+        "The API misbehaved and the evidence is strong: a crash, forbidden or "
+        "suspicious input accepted, or data that does not read back as written."
+    ),
+    "possible": (
+        "Worth a look, but the evidence is weaker or the impact is low: a heuristic "
+        "reading of a value, or a low-severity acceptance."
+    ),
+    "documentation": (
+        "The API and its OpenAPI document disagree. The behaviour may well be right; "
+        "the document (or the code) needs updating so clients know what to expect."
+    ),
+    "inconclusive": (
+        "The request may not have reached the operation, so these say nothing certain "
+        "about it."
+    ),
+    "dismissed": "Marked as false positives during triage.",
+}
+_DOCUMENTATION_CATEGORIES = {"spec_gap", "schema_mismatch"}
+
+# Why a finding of each category is a problem, in one sentence.
+WHY_IT_MATTERS = {
+    "crash": (
+        "A 5xx means the API did not handle the input: whatever it was, the server "
+        "should answer with a 4xx it chose, not an error it did not."
+    ),
+    "validation_gap": (
+        "Input the specification forbids, or that no sensible API should accept, "
+        "reached the application and was stored or acted on."
+    ),
+    "state_bug": (
+        "What the API stored or returned differs from what it accepted, so clients "
+        "cannot trust a success response."
+    ),
+    "spec_gap": (
+        "Clients built from the document will expect something the API does not do. "
+        "This is a documentation defect unless the behaviour itself is wrong."
+    ),
+    "schema_mismatch": "The response does not have the shape the document promises.",
+    "inconsistency": "The API answered differently from what the same scenario led to expect.",
+    "business_rule_violation": "A business rule the rules file states did not hold.",
+    "bug": "The API did not behave as its contract requires.",
+    "security": "The behaviour exposes data or actions it should protect.",
+    "performance": "The response took longer than the scenario allows.",
+    "false_positive_risk": (
+        "The request used generated sample values, so the answer may be about the "
+        "values rather than the operation."
+    ),
+}
+
+
+def classify_finding(
+    category: str, severity: str, confidence: str, status: str = "open"
+) -> str:
+    """Which group of the report a finding belongs to."""
+    if status == "false_positive":
+        return "dismissed"
+    if status == "confirmed":
+        return "bug"
+    if category == "false_positive_risk":
+        return "inconclusive"
+    if category in _DOCUMENTATION_CATEGORIES:
+        return "documentation"
+    if confidence == "low" or severity in {"low", "info"}:
+        return "possible"
+    return "bug"
+
+
+def scenario_label(test_type: str) -> str:
+    return SCENARIO_LABELS.get(test_type, test_type.replace("_", " ").capitalize())
+
 _INK = colors.HexColor("#111827")
 _MUTED = colors.HexColor("#6b7280")
 _RULE = colors.HexColor("#e5e7eb")
@@ -59,6 +174,8 @@ _ACCENT = colors.HexColor("#1e3a8a")
 
 # A body longer than this is cut on the page; the full text stays in the API.
 _MAX_BODY_CHARS = 1_500
+# A request or a verdict inside the test-case table is shorter still.
+_MAX_CELL_CHARS = 320
 
 
 @dataclass
@@ -89,6 +206,24 @@ class ReportFinding:
     response_body: Any = None
     response_time_ms: int | None = None
     assessment: ReportAssessment | None = None
+    confidence: str = ""
+    probable_cause: str = ""
+    # Each step: method, url, body, status_code, note.
+    reproduction: list[dict[str, Any]] = field(default_factory=list)
+    # Triage status: open, confirmed, false_positive, resolved.
+    status: str = "open"
+
+    @property
+    def group(self) -> str:
+        return classify_finding(self.category, self.severity, self.confidence, self.status)
+
+
+@dataclass
+class ReportResource:
+    endpoint: str
+    resource_id: str
+    status: str
+    detail: str
 
 
 @dataclass
@@ -99,6 +234,50 @@ class ReportEndpoint:
     failed: int
     errors: int
     findings: int
+    # Cases still pending or skipped: generated, never sent.
+    not_run: int = 0
+    # Scenario label -> number of cases, e.g. {"Boundary value": 4}.
+    scenarios: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def executed(self) -> int:
+        return self.passed + self.failed + self.errors
+
+
+@dataclass
+class ReportCase:
+    """One generated test case as the details table shows it."""
+
+    id: int
+    name: str
+    endpoint: str
+    test_type: str
+    purpose: str
+    # The request as sent (or as generated, when it was never sent), with
+    # secret-named values already masked.
+    request: str
+    expected_status: int | None
+    actual_status: int | None
+    status: str
+    detail: str
+    requests_sent: int = 0
+    findings: int = 0
+
+    @property
+    def scenario(self) -> str:
+        return scenario_label(self.test_type)
+
+
+@dataclass
+class ReportSequence:
+    """A case that sent several requests: a setup create, then the request
+    under test, then a read-back."""
+
+    case: str
+    endpoint: str
+    status: str
+    # Each step: method, url, status_code (None when no response), note.
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +309,33 @@ class RunReport:
     analysis: ReportAnalysis | None = None
     # What part of the API the run tested, e.g. "All 40 endpoints".
     scope: str = ""
+    # Everything the run created in the target, deleted or not.
+    resources: list[ReportResource] = field(default_factory=list)
+    resources_total: int = 0
+    cases: list[ReportCase] = field(default_factory=list)
+    cases_total: int = 0
+    sequences: list[ReportSequence] = field(default_factory=list)
+    sequences_total: int = 0
+    # Operations of the specification that executed no case in this run.
+    not_tested: list[str] = field(default_factory=list)
+    not_tested_total: int = 0
+    # (reason, how many cases) for cases never sent, and for inconclusive ones.
+    not_run_reasons: list[tuple[str, int]] = field(default_factory=list)
+    inconclusive_reasons: list[tuple[str, int]] = field(default_factory=list)
+
+    @property
+    def executed(self) -> int:
+        return sum(self.results.get(s, 0) for s in ("passed", "failed", "error"))
+
+    @property
+    def not_run(self) -> int:
+        return sum(self.results.get(s, 0) for s in ("pending", "skipped", "running"))
+
+    def findings_by_group(self) -> dict[str, list[ReportFinding]]:
+        groups: dict[str, list[ReportFinding]] = {group: [] for group in FINDING_GROUPS}
+        for finding in self.findings:
+            groups[finding.group].append(finding)
+        return groups
 
 
 def render(report: RunReport) -> bytes:
@@ -148,12 +354,15 @@ def render(report: RunReport) -> bytes:
     styles = _styles()
     story: list[Any] = []
     story += _cover(report, styles)
-    story += _at_a_glance(report, styles)
+    story += _executive_summary(report, styles)
     if report.analysis is not None:
         story += _analysis_section(report.analysis, styles)
-    if report.endpoints:
-        story += _endpoints_section(report.endpoints, styles)
+    story += _coverage_section(report, styles)
     story += _findings_section(report, styles)
+    story += _cases_section(report, styles)
+    if report.sequences or report.resources:
+        story += _stateful_section(report, styles)
+    story += _limitations_section(report, styles)
 
     def footer(canvas, doc) -> None:
         canvas.saveState()
@@ -198,32 +407,26 @@ def _cover(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
     ]
 
 
-def _at_a_glance(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
+def _executive_summary(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
     results = report.results
-    tiles = [
-        ("Test cases", results.get("total", 0)),
-        ("Passed", results.get("passed", 0)),
-        ("Failed", results.get("failed", 0)),
-        ("Errors", results.get("error", 0)),
-        ("Findings", report.findings_total),
+    case_tiles = [
+        ("Generated", results.get("total", 0)),
+        ("Executed", report.executed),
+        (COUNT_LABELS["passed"], results.get("passed", 0)),
+        (COUNT_LABELS["failed"], results.get("failed", 0)),
+        (COUNT_LABELS["error"], results.get("error", 0)),
+        (COUNT_LABELS["pending"], report.not_run),
     ]
-    tile_table = Table(
-        [
-            [Paragraph(str(value), styles["tile_value"]) for _, value in tiles],
-            [Paragraph(label, styles["tile_label"]) for label, _ in tiles],
-        ],
-        colWidths=[34.8 * mm] * len(tiles),
-    )
-    tile_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), _PANEL),
-                ("LINEAFTER", (0, 0), (-2, -1), 2, colors.white),
-                ("TOPPADDING", (0, 0), (-1, 0), 8),
-                ("BOTTOMPADDING", (0, -1), (-1, -1), 8),
-            ]
-        )
-    )
+    # Every finding count below describes the findings the report holds. When
+    # the run has more than the report shows, the first tile says so and the
+    # groups and severities add up to the shown number, not the total.
+    shown = len(report.findings)
+    capped = shown < report.findings_total
+    groups = report.findings_by_group()
+    finding_tiles = [
+        ("Findings shown" if capped else "Findings", shown),
+        *((GROUP_TITLES[group], len(groups[group])) for group in FINDING_GROUPS),
+    ]
 
     counts = {severity: 0 for severity in SEVERITY_ORDER}
     for finding in report.findings:
@@ -239,14 +442,75 @@ def _at_a_glance(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[A
         TableStyle([("GRID", (0, 0), (-1, -1), 0.5, _RULE), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])
     )
 
+    tested = [e for e in report.endpoints if e.executed]
+    paths = {e.label.split(" ", 1)[1] if " " in e.label else e.label for e in tested}
+    methods = {e.label.split(" ", 1)[0] for e in tested}
+    coverage = (
+        f"{_count(len(tested), 'operation')} executed at least one test case: "
+        f"{_count(len(paths), 'endpoint path')}, {_count(len(methods), 'HTTP method')} "
+        f"({', '.join(sorted(methods))})."
+        if tested
+        else "No test case was executed."
+    )
+
     return [
-        Paragraph("At a glance", styles["h1"]),
-        tile_table,
-        Spacer(1, 5 * mm),
-        Paragraph("Findings by severity", styles["h3"]),
+        Paragraph("Executive summary", styles["h1"]),
+        Paragraph("Test results", styles["h3"]),
+        _tiles(case_tiles, styles),
+        Paragraph(
+            _text(
+                f"{coverage} A case is one request (or a short sequence) sent to the API and "
+                f"judged against the document. \"{COUNT_LABELS['error']}\" are cases that got "
+                f"no verdict - refused, timed out, or collided with existing data - and are "
+                f"inconclusive, not failures."
+            ),
+            styles["muted"],
+        ),
+        Spacer(1, 4 * mm),
+        Paragraph("Findings", styles["h3"]),
+        _tiles(finding_tiles, styles),
+        Paragraph(
+            _text(
+                (
+                    f"The run produced {report.findings_total} findings; the {shown} most "
+                    f"severe are in this report, and every count below describes those. "
+                    if capped
+                    else ""
+                )
+                + "Findings count problems, not cases: one failed case can produce several "
+                "findings, and a documentation note is attached to a case that passed. "
+                "Only the \"Bugs\" column claims a defect with strong evidence; "
+                "\"Dismissed\" findings were marked false positives during triage and "
+                "are counted in the severity table below as well."
+            ),
+            styles["muted"],
+        ),
+        Spacer(1, 3 * mm),
+        Paragraph("Findings by severity" + (" (shown)" if capped else ""), styles["h3"]),
         severity_table,
         Spacer(1, 6 * mm),
     ]
+
+
+def _tiles(tiles: list[tuple[str, int]], styles: dict[str, ParagraphStyle]) -> Table:
+    table = Table(
+        [
+            [Paragraph(str(value), styles["tile_value"]) for _, value in tiles],
+            [Paragraph(_text(label), styles["tile_label"]) for label, _ in tiles],
+        ],
+        colWidths=[174 * mm / len(tiles)] * len(tiles),
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), _PANEL),
+                ("LINEAFTER", (0, 0), (-2, -1), 2, colors.white),
+                ("TOPPADDING", (0, 0), (-1, 0), 8),
+                ("BOTTOMPADDING", (0, -1), (-1, -1), 8),
+            ]
+        )
+    )
+    return table
 
 
 def _analysis_section(analysis: ReportAnalysis, styles: dict[str, ParagraphStyle]) -> list[Any]:
@@ -312,10 +576,25 @@ def _analysis_section(analysis: ReportAnalysis, styles: dict[str, ParagraphStyle
     return story
 
 
-def _endpoints_section(endpoints: list[ReportEndpoint], styles: dict[str, ParagraphStyle]) -> list[Any]:
-    header = ["Endpoint", "Cases", "Passed", "Failed", "Errors", "Findings"]
-    rows = [[Paragraph(h, styles["th"]) for h in header]]
-    for endpoint in endpoints:
+def _coverage_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    story: list[Any] = [CondPageBreak(40 * mm), Paragraph("Test coverage and scenarios", styles["h1"])]
+    if not report.endpoints:
+        story += [Paragraph("No test cases were generated for this run.", styles["body"]), Spacer(1, 6 * mm)]
+        return story
+    story.append(
+        Paragraph(
+            _text(
+                "Every operation the run holds cases for, with how many were sent and how "
+                "they ended. The line under each one names the scenarios its cases cover."
+            ),
+            styles["muted"],
+        )
+    )
+    header = ["Operation", "Cases", "Sent", COUNT_LABELS["passed"], COUNT_LABELS["failed"],
+              COUNT_LABELS["error"], COUNT_LABELS["pending"], "Findings"]
+    rows: list[list[Any]] = [[Paragraph(h, styles["th"]) for h in header]]
+    style = _grid_style()
+    for endpoint in report.endpoints:
         rows.append(
             [
                 Paragraph(_text(endpoint.label), styles["mono"]),
@@ -323,17 +602,219 @@ def _endpoints_section(endpoints: list[ReportEndpoint], styles: dict[str, Paragr
                     Paragraph(str(value), styles["cell_center"])
                     for value in (
                         endpoint.cases,
+                        endpoint.executed,
                         endpoint.passed,
                         endpoint.failed,
                         endpoint.errors,
+                        endpoint.not_run,
                         endpoint.findings,
                     )
                 ),
             ]
         )
-    table = Table(rows, colWidths=[84 * mm] + [18 * mm] * 5, repeatRows=1)
+        scenarios = " - ".join(f"{label} {count}" for label, count in endpoint.scenarios.items())
+        rows.append([Paragraph(_text(scenarios or "-"), styles["muted"])] + [""] * 7)
+        row = len(rows) - 1
+        style.add("SPAN", (0, row), (-1, row))
+        style.add("TOPPADDING", (0, row), (-1, row), 0)
+        style.add("LINEBELOW", (0, row - 1), (-1, row - 1), 0, colors.white)
+    table = Table(rows, colWidths=[55 * mm] + [17 * mm] * 7, repeatRows=1)
+    table.setStyle(style)
+    return [*story, Spacer(1, 2 * mm), table, Spacer(1, 6 * mm)]
+
+
+def _cases_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    story: list[Any] = [PageBreak(), Paragraph("Test case details", styles["h1"])]
+    if not report.cases:
+        story.append(Paragraph("No test cases were generated for this run.", styles["body"]))
+        return story
+    if len(report.cases) < report.cases_total:
+        story.append(
+            Paragraph(
+                _text(
+                    f"The first {len(report.cases)} of {report.cases_total} cases are shown, in "
+                    f"endpoint order. Every case is available from the API."
+                ),
+                styles["muted"],
+            )
+        )
+    story.append(
+        Paragraph(
+            _text(
+                "Request values are as sent; secret-named fields are masked. \"Expected\" is "
+                "the status the document promises for the case, or none when it promises "
+                "nothing. The last column is the recorded verdict."
+            ),
+            styles["muted"],
+        )
+    )
+    header = ["Case", "Scenario", "Request", "Expected / actual", "Result", "Verdict"]
+    widths = [34 * mm, 24 * mm, 48 * mm, 20 * mm, 18 * mm, 30 * mm]
+    by_endpoint: dict[str, list[ReportCase]] = {}
+    for case in report.cases:
+        by_endpoint.setdefault(case.endpoint, []).append(case)
+    for endpoint, cases in by_endpoint.items():
+        rows: list[list[Any]] = [[Paragraph(h, styles["th"]) for h in header]]
+        for case in cases:
+            expected = str(case.expected_status) if case.expected_status is not None else "none"
+            actual = str(case.actual_status) if case.actual_status is not None else "-"
+            rows.append(
+                [
+                    [
+                        Paragraph(f"<b>#{case.id}</b> {_text(case.name)}", styles["cell"]),
+                        Paragraph(_text(_clip(case.purpose, 160)), styles["muted"]),
+                    ],
+                    Paragraph(_text(case.scenario), styles["cell"]),
+                    Paragraph(_mono(_clip(case.request, _MAX_CELL_CHARS)), styles["mono"]),
+                    Paragraph(_text(f"{expected} / {actual}"), styles["cell_center"]),
+                    Paragraph(_text(STATUS_LABELS.get(case.status, case.status)), styles["cell_center"]),
+                    [
+                        Paragraph(_text(_clip(case.detail, _MAX_CELL_CHARS) or "-"), styles["muted"]),
+                        *(
+                            [Paragraph(_text(_count(case.findings, "finding")), styles["cell"])]
+                            if case.findings
+                            else []
+                        ),
+                    ],
+                ]
+            )
+        table = Table(rows, colWidths=widths, repeatRows=1)
+        table.setStyle(_grid_style())
+        story += [
+            CondPageBreak(30 * mm),
+            Paragraph(_text(endpoint), styles["h3"]),
+            table,
+            Spacer(1, 4 * mm),
+        ]
+    return story
+
+
+def _stateful_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    story: list[Any] = [CondPageBreak(50 * mm), Paragraph("Stateful testing and cleanup", styles["h1"])]
+    if report.sequences:
+        story.append(Paragraph("Sequences", styles["h3"]))
+        story.append(
+            Paragraph(
+                _text(
+                    "Cases that sent more than one request: a create followed by the request "
+                    "under test, the same create twice, or a create read back. Each step is "
+                    "the request as sent and the status it received."
+                ),
+                styles["muted"],
+            )
+        )
+        if len(report.sequences) < report.sequences_total:
+            story.append(
+                Paragraph(
+                    _text(f"The first {len(report.sequences)} of {report.sequences_total} are shown."),
+                    styles["muted"],
+                )
+            )
+        for sequence in report.sequences:
+            lines: list[Any] = [
+                Paragraph(
+                    f"<b>{_text(sequence.endpoint)}</b> - {_text(sequence.case)} - "
+                    f"{_text(STATUS_LABELS.get(sequence.status, sequence.status))}",
+                    styles["cell"],
+                )
+            ]
+            for number, step in enumerate(sequence.steps, start=1):
+                status = step.get("status_code")
+                shown = str(status) if status is not None else "no response"
+                note = f" - {step['note']}" if step.get("note") else ""
+                lines.append(
+                    Paragraph(
+                        _text(f"{number}. {step.get('method')} {step.get('url')} -> {shown}{note}"),
+                        styles["mono"],
+                    )
+                )
+            story.append(KeepTogether(lines))
+            story.append(Spacer(1, 2 * mm))
+    if report.resources:
+        story += _resources_section(report, styles)
+    story.append(Spacer(1, 4 * mm))
+    return story
+
+
+def _resources_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    resources = report.resources
+    total = report.resources_total or len(resources)
+    deleted = sum(1 for r in resources if r.status == "deleted")
+    failed = sum(1 for r in resources if r.status == "delete_failed")
+    left = len(resources) - deleted - failed
+    story: list[Any] = [
+        Paragraph("Created data and cleanup", styles["h3"]),
+        Paragraph(
+            _text(
+                f"The run created {total} resources in the target: {deleted} deleted, "
+                f"{failed} could not be deleted, {left} left in place."
+                + (" Cleanup was not requested for this run." if not deleted and not failed else "")
+            ),
+            styles["body"],
+        ),
+    ]
+    if len(resources) < total:
+        story.append(Paragraph(_text(f"The first {len(resources)} are listed."), styles["muted"]))
+    labels = {"deleted": "Deleted", "delete_failed": "Delete failed", "left": "Left in place"}
+    rows = [[Paragraph(h, styles["th"]) for h in ("Created by", "ID", "Cleanup", "Detail")]]
+    for resource in resources:
+        rows.append(
+            [
+                Paragraph(_text(resource.endpoint), styles["mono"]),
+                Paragraph(_text(resource.resource_id or "-"), styles["mono"]),
+                Paragraph(_text(labels.get(resource.status, resource.status)), styles["cell"]),
+                Paragraph(_text(resource.detail or "-"), styles["muted"]),
+            ]
+        )
+    table = Table(rows, colWidths=[58 * mm, 28 * mm, 22 * mm, 66 * mm], repeatRows=1)
     table.setStyle(_grid_style())
-    return [CondPageBreak(40 * mm), Paragraph("Endpoints", styles["h1"]), table, Spacer(1, 6 * mm)]
+    story += [Spacer(1, 2 * mm), table]
+    return story
+
+
+def _limitations_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
+    story: list[Any] = [CondPageBreak(50 * mm), Paragraph("Limitations", styles["h1"])]
+    bullets: list[str] = []
+    if report.not_run:
+        reasons = "; ".join(f"{count} - {reason}" for reason, count in report.not_run_reasons)
+        bullets.append(
+            f"{report.not_run} generated cases were never sent"
+            + (f": {reasons}." if reasons else ".")
+            + " They are not evidence about the API either way."
+        )
+    if report.results.get("error", 0):
+        reasons = "; ".join(f"{count} - {reason}" for reason, count in report.inconclusive_reasons)
+        bullets.append(
+            f"{report.results['error']} cases got no verdict"
+            + (f": {reasons}." if reasons else ".")
+        )
+    if report.not_tested_total:
+        listed = ", ".join(report.not_tested)
+        more = (
+            f" and {report.not_tested_total - len(report.not_tested)} more"
+            if report.not_tested_total > len(report.not_tested)
+            else ""
+        )
+        bullets.append(
+            f"{report.not_tested_total} operations of the specification executed no case in "
+            f"this run (outside its scope, or no case could be generated): {listed}{more}."
+        )
+    if not report.cases_total:
+        bullets.append("No test cases were generated, so nothing about the API was tested.")
+    bullets.append(
+        "Generated cases do not cover authentication or authorisation, regex 'pattern' "
+        "constraints, or request bodies the generator could not build from the document. "
+        "Only the happy path of an operation on one resource creates its own resource "
+        "first; its other cases use sample path values."
+    )
+    bullets.append(
+        "A documentation gap records a difference between the API and its document, "
+        "not a defect. A finding's confidence says how strong its evidence is; a person "
+        "still decides each one."
+    )
+    for bullet in bullets:
+        story.append(Paragraph("- " + _text(bullet), styles["body"]))
+    return story
 
 
 def _findings_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> list[Any]:
@@ -351,9 +832,24 @@ def _findings_section(report: RunReport, styles: dict[str, ParagraphStyle]) -> l
                 styles["muted"],
             )
         )
-    story.append(Spacer(1, 2 * mm))
-    for finding in report.findings:
-        story += _finding(finding, styles)
+    groups = report.findings_by_group()
+    for group in FINDING_GROUPS:
+        findings = groups[group]
+        if not findings:
+            continue
+        story += [
+            CondPageBreak(40 * mm),
+            Spacer(1, 3 * mm),
+            Paragraph(f"{GROUP_TITLES[group]} ({len(findings)})", styles["h2"]),
+            Paragraph(_text(GROUP_INTROS[group]), styles["muted"]),
+            Spacer(1, 3 * mm),
+        ]
+        if group == "dismissed":
+            for finding in findings:
+                story.append(Paragraph(_text(f"#{finding.id} {finding.title}"), styles["cell"]))
+            continue
+        for finding in findings:
+            story += _finding(finding, styles)
     return story
 
 
@@ -377,10 +873,20 @@ def _finding(finding: ReportFinding, styles: dict[str, ParagraphStyle]) -> list[
         )
     )
 
+    category = finding.category.replace("_", " ")
+    if finding.confidence:
+        category += f" - {finding.confidence} confidence"
     rows: list[tuple[str, str]] = [
-        ("Category", finding.category.replace("_", " ")),
+        ("Category", category),
         ("Endpoint", finding.endpoint or "-"),
     ]
+    if finding.probable_cause:
+        rows.append(("Probable cause", finding.probable_cause))
+    why = WHY_IT_MATTERS.get(finding.category)
+    if why:
+        rows.append(("Why it matters", why))
+    if finding.status and finding.status != "open":
+        rows.append(("Triage", finding.status.replace("_", " ")))
     if finding.test_case:
         rows.append(("Test case", f"{finding.test_case} ({finding.test_type.replace('_', ' ')})"))
     if finding.expected_status is not None or finding.response_status is not None:
@@ -394,7 +900,23 @@ def _finding(finding: ReportFinding, styles: dict[str, ParagraphStyle]) -> list[
         block += [Spacer(1, 2 * mm), Paragraph(_text(finding.description), styles["body"])]
 
     evidence: list[Any] = []
-    if finding.request_url:
+    if len(finding.reproduction) > 1:
+        evidence.append(Paragraph("Steps to reproduce", styles["label"]))
+        for step in finding.reproduction:
+            note = f" - {step['note']}" if step.get("note") else ""
+            evidence.append(
+                Paragraph(
+                    _text(
+                        f"{step.get('step')}. {step.get('method')} {step.get('url')} -> "
+                        f"{step.get('status_code') if step.get('status_code') is not None else 'no response'}"
+                        f"{note}"
+                    ),
+                    styles["mono"],
+                )
+            )
+            if step.get("body") is not None:
+                evidence.append(Paragraph(_mono(_body(step["body"])), styles["mono"]))
+    elif finding.request_url:
         evidence.append(Paragraph("Request", styles["label"]))
         evidence.append(
             Paragraph(_text(f"{finding.request_method} {finding.request_url}"), styles["mono"])
@@ -469,6 +991,7 @@ def _styles() -> dict[str, ParagraphStyle]:
         "kicker": style("kicker", fontSize=9, textColor=_MUTED, leading=12),
         "title": style("title", fontName="Helvetica-Bold", fontSize=22, leading=27),
         "h1": style("h1", fontName="Helvetica-Bold", fontSize=15, leading=19, spaceBefore=4, spaceAfter=6),
+        "h2": style("h2", fontName="Helvetica-Bold", fontSize=12.5, leading=16, spaceAfter=3),
         "h3": style("h3", fontName="Helvetica-Bold", fontSize=10.5, leading=14, spaceAfter=3),
         "h3_inline": style("h3_inline", fontSize=10.5, leading=14),
         "body": style("body", fontSize=9.5, leading=13.5),
@@ -535,6 +1058,15 @@ def _body(body: Any) -> str:
     if len(rendered) > _MAX_BODY_CHARS:
         rendered = rendered[:_MAX_BODY_CHARS] + " [truncated]"
     return rendered
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
+def _clip(value: str, limit: int) -> str:
+    value = str(value or "")
+    return value if len(value) <= limit else value[:limit] + " [truncated]"
 
 
 def _when(moment: datetime | None) -> str:

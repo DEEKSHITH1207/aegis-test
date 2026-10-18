@@ -39,9 +39,21 @@ OpenAPI document. A happy_path case sends a valid request. Every other case \
 type (missing_required, empty_value, invalid_type, invalid_format, \
 invalid_enum, below_minimum, above_maximum, below_min_length, \
 above_max_length) breaks exactly one documented constraint and is otherwise \
-valid. AegisTest judges only the status code: a 5xx is a bug (high); a 2xx to \
-an invalid case is a validation_gap (medium); a status other than the \
-documented one is an inconsistency (low).
+valid. Fields that look unique (names, codes, years) get fresh values so \
+requests do not collide with existing data; a case that still collides \
+(409 or "already exists") is sent again with fresh values. A happy path on \
+{collection}/{id} first creates a resource and uses its real ID. cross_field and \
+suspicious_value cases send schema-valid but suspicious input (an end before \
+its start, a negative amount, 29 February 2025); accepting it is a \
+validation_gap ("suspicious acceptance"). duplicate_create sends the same \
+create twice; create_read_back creates a resource and reads it back. A 5xx is \
+a crash (high); a 2xx to an invalid case is a validation_gap (medium); a \
+response or read-back that differs from what was sent, a 404 for a resource \
+created a moment earlier, or a deleted resource still readable is a \
+state_bug; a status other than the documented one is a spec_gap (low), and \
+invalid input refused with an undocumented 4xx is only a spec_gap note on a \
+passing case. Each finding states its own \
+confidence and probable cause, and lists the requests that reproduce it.
 - Business-rules runs. A scenario sends a sequence of requests, then a rule \
 compares a value from a response with a value worked out from the rules file \
 ("expected_working" shows how). A rule that did not hold is a \
@@ -223,6 +235,12 @@ def brief(finding: Finding) -> dict[str, Any]:
         "severity": finding.severity,
         "category": finding.category,
     }
+    if finding.confidence:
+        entry["confidence"] = finding.confidence
+    if finding.probable_cause:
+        entry["probable_cause"] = finding.probable_cause
+    if len(finding.reproduction or []) > 1:
+        entry["reproduction"] = clip(finding.reproduction)
     if finding.test_case_id:
         test_case = finding.test_case
         endpoint = test_case.endpoint

@@ -13,6 +13,9 @@ function finding(id: number, severity: Finding["severity"], title: string): Find
     description: `Description of ${id}`,
     severity,
     category: "validation_gap",
+    confidence: "high",
+    probable_cause: "",
+    reproduction: [],
     status: "open",
     evidence: {
       expected_status_code: 400,
@@ -65,5 +68,27 @@ describe("FindingsList", () => {
     render(<FindingsList findings={[]} assessments={new Map()} />);
 
     expect(screen.getByText(/No findings/)).toBeInTheDocument();
+  });
+});
+
+describe("FindingsList finding details", () => {
+  it("shows the confidence, the probable cause and every step to reproduce", async () => {
+    const crash: Finding = {
+      ...finding(3, "high", "POST /units: duplicate create returns 500 (unhandled unique constraint)"),
+      category: "crash",
+      probable_cause: "The unique-constraint error is not turned into a 409.",
+      reproduction: [
+        { step: 1, note: "Setup: create the resource.", method: "POST", url: "http://api.test/units", body: { name: "MT-1a2b3c" }, status_code: 201 },
+        { step: 2, note: "Send the same request again.", method: "POST", url: "http://api.test/units", body: { name: "MT-1a2b3c" }, status_code: 500 },
+      ],
+    };
+    render(<FindingsList findings={[crash]} assessments={new Map()} />);
+
+    expect(screen.getByText(/crash - high confidence/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /duplicate create/ }));
+
+    expect(screen.getByText(/not turned into a 409/)).toBeInTheDocument();
+    expect(screen.getByText("Steps to reproduce")).toBeInTheDocument();
+    expect(screen.getByText(/2\. POST http:\/\/api\.test\/units -> 500/)).toBeInTheDocument();
   });
 });

@@ -215,11 +215,28 @@ already executed would silently change what its results mean.
 
 ```
 View ─ start_execution ─(on commit)→ Celery task ─ execute_test_run
-                                                     │ per case:
-                                     executor.prepare → executor.send
+                                                     │ per case (one request, or a sequence):
+                                     executor.prepare → executor.send   (sent again, up to 3×,
+                                                       on a collision: refreshed_input for a
+                                                       happy path, retry_input for a semantic case)
+                                                     │ a case on {collection}/{id} (every PUT/
+                                                       PATCH/DELETE case, a GET's happy path):
+                                                       POST the collection first, use its ID,
+                                                       or skip it when nothing disposable exists
                                                      → RequestRecord / ResponseRecord
-                                     evaluation.evaluate → TestCase.status, Findings
+                                                     → CreatedResource for each create
+                                     evaluation.evaluate / duplicate_create / read_back
+                                       + oracles (echo, derived fields, schema)
+                                                     → TestCase.status, Findings
+                                                     │ then, if run.cleanup:
+                                     cleanup_test_run → DELETE each CreatedResource
 ```
+
+Generation goes through `semantic.build_test_cases`, which wraps the
+generator: it gives likely-unique fields fresh values derived from the run's
+seed and the case name (so a run still regenerates identically), and adds the
+cross-field, suspicious-value and sequence cases. `oracles.py` is pure too: it
+reads a response body (echo, derived fields, response schema, conflicts, IDs).
 
 Three modules, each with one job:
 

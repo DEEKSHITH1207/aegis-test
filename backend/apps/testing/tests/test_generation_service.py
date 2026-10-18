@@ -65,6 +65,11 @@ def test_generation_produces_the_expected_kinds_of_case(run: TestRun) -> None:
         TestCaseType.ABOVE_MAXIMUM,
         TestCaseType.BELOW_MIN_LENGTH,
         TestCaseType.ABOVE_MAX_LENGTH,
+        # POST /users documents 201 and the API has GET /users/{userId}.
+        TestCaseType.DUPLICATE_CREATE,
+        TestCaseType.CREATE_READ_BACK,
+        # A whitespace-only and a non-ASCII name.
+        TestCaseType.SUSPICIOUS_VALUE,
     }
 
 
@@ -235,9 +240,9 @@ def test_an_unsupported_body_schema_is_skipped_with_a_warning(db) -> None:
 
 
 def test_a_failed_generation_leaves_nothing_behind(run: TestRun, monkeypatch) -> None:
-    from apps.testing import generator
+    from apps.testing import semantic
 
-    real = generator.generate_test_cases
+    real = semantic.build_test_cases
     calls = {"n": 0}
 
     def explode_on_the_second_endpoint(endpoint, **kwargs):
@@ -246,7 +251,7 @@ def test_a_failed_generation_leaves_nothing_behind(run: TestRun, monkeypatch) ->
             raise RuntimeError("generation blew up")
         return real(endpoint, **kwargs)
 
-    monkeypatch.setattr(services.generator, "generate_test_cases", explode_on_the_second_endpoint)
+    monkeypatch.setattr(services.semantic, "build_test_cases", explode_on_the_second_endpoint)
 
     with pytest.raises(RuntimeError):
         services.generate_test_cases_for_run(test_run=run)

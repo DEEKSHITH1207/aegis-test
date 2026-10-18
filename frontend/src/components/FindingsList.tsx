@@ -80,6 +80,7 @@ export default function FindingsList({
                   <br />
                   <span className="finding-meta">
                     #{finding.id} - {finding.category.replace(/_/g, " ")}
+                    {finding.confidence && ` - ${finding.confidence} confidence`}
                     {request && ` - ${request.method} ${new URL(request.url, "http://x").pathname}`}
                   </span>
                 </span>
@@ -88,7 +89,27 @@ export default function FindingsList({
               {expanded && (
                 <div className="finding-detail">
                   {finding.description && <p style={{ margin: 0 }}>{finding.description}</p>}
-                  {request && (
+                  {finding.probable_cause && (
+                    <p style={{ margin: 0 }}>
+                      <strong>Probable cause:</strong> {finding.probable_cause}
+                    </p>
+                  )}
+                  {finding.reproduction.length > 1 && (
+                    <div className="evidence">
+                      <div className="label">Steps to reproduce</div>
+                      <pre>
+                        {finding.reproduction
+                          .map(
+                            (step) =>
+                              `${step.step}. ${step.method} ${step.url} -> ${step.status_code ?? "no response"}` +
+                              (step.note ? `   (${step.note})` : "") +
+                              (step.body !== undefined && step.body !== null ? `\n${pretty(step.body)}` : ""),
+                          )
+                          .join("\n\n")}
+                      </pre>
+                    </div>
+                  )}
+                  {request && finding.reproduction.length <= 1 && (
                     <div className="evidence">
                       <div className="label">Request</div>
                       <pre>

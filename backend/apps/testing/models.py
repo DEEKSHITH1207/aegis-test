@@ -77,6 +77,15 @@ class TestCaseType(models.TextChoices):
     BELOW_MIN_LENGTH = "below_min_length", "Shorter than the minimum length"
     ABOVE_MAX_LENGTH = "above_max_length", "Longer than the maximum length"
 
+    # Sequences of requests, judged on how the API's state behaves.
+    DUPLICATE_CREATE = "duplicate_create", "The same create sent twice"
+    CREATE_READ_BACK = "create_read_back", "Create, then read it back"
+
+    # Schema-valid input that a sensible API should still question: a range
+    # whose end is before its start, a negative price, 29 February 2025.
+    CROSS_FIELD = "cross_field", "Suspicious combination of fields"
+    SUSPICIOUS_VALUE = "suspicious_value", "Valid but suspicious value"
+
     # Coarser kinds, for cases written by hand or by later phases.
     VALIDATION = "validation", "Input validation"
     AUTHENTICATION = "authentication", "Authentication"
@@ -119,6 +128,28 @@ class FindingCategory(models.TextChoices):
     # A well-formed, successful response that holds a wrong value: a rule from
     # a business-rules file did not hold.
     BUSINESS_RULE_VIOLATION = "business_rule_violation", "Business rule violation"
+    # The kinds generated test runs report.
+    CRASH = "crash", "Crash"
+    STATE_BUG = "state_bug", "State bug"
+    SPEC_GAP = "spec_gap", "Specification gap"
+    # The evidence may point at AegisTest's own test data rather than the API.
+    FALSE_POSITIVE_RISK = "false_positive_risk", "Possible false positive"
+
+
+class FindingConfidence(models.TextChoices):
+    """How strongly a finding's evidence supports it."""
+
+    LOW = "low", "Low"
+    MEDIUM = "medium", "Medium"
+    HIGH = "high", "High"
+
+
+class ResourceStatus(models.TextChoices):
+    """What became of a resource a run created in the API under test."""
+
+    LEFT = "left", "Left behind"
+    DELETED = "deleted", "Deleted"
+    DELETE_FAILED = "delete_failed", "Delete failed"
 
 
 class ScenarioStatus(models.TextChoices):
@@ -277,6 +308,9 @@ class TestRun(TimeStampedModel):
     # The endpoints this run tests. Empty means every endpoint of the
     # specification, including ones imported after the run was created.
     endpoints = models.ManyToManyField(Endpoint, blank=True, related_name="selected_in_runs")
+    # Delete what the run created once it has executed, where the API offers
+    # a DELETE for it.
+    cleanup = models.BooleanField(default=False)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
@@ -348,6 +382,9 @@ class TestCase(TimeStampedModel):
     status_detail = models.TextField(
         blank=True, default="", help_text="Why the case received its status."
     )
+    # What a semantic case checks beyond the status code: why accepting it
+    # would be suspicious, and how much that would matter.
+    oracle = models.JSONField(blank=True, default=dict)
 
     class Meta:
         ordering = ["id"]
@@ -611,6 +648,12 @@ class Finding(TimeStampedModel):
     status = models.CharField(
         max_length=16, choices=FindingStatus.choices, default=FindingStatus.OPEN
     )
+    confidence = models.CharField(
+        max_length=8, choices=FindingConfidence.choices, blank=True, default=""
+    )
+    probable_cause = models.CharField(max_length=500, blank=True, default="")
+    # The fewest requests that show the problem, setup calls included, in order.
+    reproduction = models.JSONField(blank=True, default=list)
 
     class Meta:
         ordering = ["-created_at", "-id"]
@@ -739,3 +782,37 @@ class FindingAssessment(models.Model):
 
     def __str__(self) -> str:
         return f"Finding {self.finding_id}: {self.verdict}"
+
+
+class CreatedResource(models.Model):
+    """Something a test run created in the API under test.
+
+    Recorded for every create that succeeded, so a run can clean up after
+    itself and its report can say what it left behind.
+    """
+
+    test_run = models.ForeignKey(
+        TestRun, on_delete=models.CASCADE, related_name="created_resources"
+    )
+    test_case = models.ForeignKey(
+        TestCase, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    # The operation that created it.
+    endpoint = models.ForeignKey(Endpoint, on_delete=models.CASCADE, related_name="+")
+    resource_id = models.CharField(max_length=255, blank=True, default="")
+    delete_url = models.CharField(max_length=2000, blank=True, default="")
+    status = models.CharField(
+        max_length=16, choices=ResourceStatus.choices, default=ResourceStatus.LEFT
+    )
+    detail = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [
+            models.Index(fields=["test_run", "status"], name="idx_resource_run_status"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.endpoint} -> {self.resource_id or '?'}"

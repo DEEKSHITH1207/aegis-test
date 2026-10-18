@@ -703,3 +703,16 @@ select:focus-visible,
   font-size: 0.75rem;
   color: var(--text-muted);
 }
+
+.resource-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.resource-list code {
+  font-size: 0.8rem;
+}

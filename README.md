@@ -7,14 +7,17 @@ cases against a target API, analyses the responses, and reports bugs, validation
 gaps, inconsistencies and security issues. An LLM is used as a reasoning layer
 over the collected evidence — never as the sole source of truth.
 
-**Status: Phase 6 — LLM analysis.** AegisTest reads an OpenAPI 3.x or
+**Status: Phase 7 — stateful testing.** AegisTest reads an OpenAPI 3.x or
 Swagger 2.0 document, turns it into endpoints, generates a deterministic suite of
 test cases from their schemas, sends each one to the API under test, and records
-what came back as evidence and findings. A [business-rules file](#business-rules)
+what came back as evidence and findings. Cases can be [sequences](#sequences)
+that create a resource and then read it back or create it again, every
+response is checked against what was sent, and the resources a run creates are
+[cleaned up](#cleaning-up) afterwards. A [business-rules file](#business-rules)
 adds multi-step scenarios that catch wrong values in otherwise successful
 responses. [LLM analysis](#llm-analysis) asks Claude for a second opinion on a
 finished run's findings — likely real or likely noise, the probable cause, what
-to do next — without ever changing a finding itself.
+to do next — without ever changing a finding itself. It is off by default.
 
 ## Architecture
 
@@ -176,18 +179,44 @@ migration `0006` from the stored document; re-importing one does the same.
 
 `GET /api/v1/test-runs/<id>/report.pdf` renders, with ReportLab:
 
-- the API, target, status and timings;
-- results at a glance and findings by severity;
+- the API, target, scope, status and timings;
+- an **executive summary**: cases generated, executed, passed, failed, error
+  (no verdict) and not run, with the same labels as the dashboard; how many
+  operations, paths and methods executed a case; findings grouped as bugs,
+  possible issues, documentation gaps and inconclusive, and by severity. Case
+  counts and finding counts are kept apart: one case can produce several
+  findings, and a note can sit on a case that passed;
 - the latest completed AI analysis: summary, verdict counts and likely root
   causes, clearly marked as advisory;
-- a per-endpoint table of cases, passes, failures and findings;
-- every finding, most severe first (up to 300): what was expected and what came
-  back, the request and an excerpt of the response body, and the AI assessment
-  beside it.
+- **test coverage**: every operation with its cases sent, passed, failed, error
+  and not run, and the scenarios its cases cover (happy path, required-field
+  validation, wrong type, boundary value, semantic rule, duplicate create,
+  create and read back);
+- **findings** (up to 300, most severe first), in four groups. *Bugs* are
+  crashes, accepted invalid or suspicious input and state bugs with medium or
+  high confidence; *possible issues* are the low-confidence or low-severity
+  ones; *documentation gaps* are every `spec_gap`, such as an undocumented 4xx,
+  and are never presented as bugs; *inconclusive* covers the rest. A finding
+  marked a false positive during triage is listed under *dismissed*. Each
+  finding shows its category, confidence, probable cause, why it matters, the
+  request, an excerpt of the response, the steps to reproduce, and the AI
+  assessment beside it;
+- **test case details** (up to 500): per operation, each case's name, scenario,
+  purpose, the request as sent, the expected and actual status, its result and
+  the recorded verdict;
+- **stateful testing and cleanup**: every case that sent more than one request,
+  step by step, and every resource the run created with whether cleanup
+  deleted it;
+- **limitations**: cases never sent and cases without a verdict, grouped by
+  reason; operations of the specification that executed no case; and what
+  generated cases do not cover.
 
 Run credentials never appear: the report is built from stored evidence, which
-is redacted when it is written. The built-in PDF fonts cover Western European
-text only; other characters print as `?`.
+is redacted when it is written, and secret-named fields in request and
+response bodies (`password`, `token`, `api_key`, ...) are masked again when
+the report is built. Long bodies and verdicts are cut on the page; the full
+text stays in the API. The built-in PDF fonts cover Western European text
+only; other characters print as `?`.
 
 ## Tests
 
@@ -220,6 +249,8 @@ database).
 | POST   | `/api/v1/test-runs/<id>/execute/`               | Send the run's requests (202, background)  |
 | GET    | `/api/v1/test-runs/<id>/test-cases/`            | Test cases; `?status=failed` filters       |
 | GET    | `/api/v1/test-runs/<id>/findings/`              | Findings produced by a run                 |
+| GET    | `/api/v1/test-runs/<id>/resources/`             | What the run created in the target         |
+| POST   | `/api/v1/test-runs/<id>/cleanup/`               | DELETE what a finished run created         |
 | POST   | `/api/v1/rules-runs/`                           | Run a business-rules file (202)            |
 | GET    | `/api/v1/rules-runs/`                           | List rules runs; `?specification=<id>`     |
 | GET    | `/api/v1/rules-runs/<id>/`                      | One rules run, with result counts          |
@@ -459,20 +490,121 @@ Rules apply in this order:
 
 | Response | Case | Finding |
 | --- | --- | --- |
-| 5xx | `failed` | **bug**, high — the input was not handled |
+| 5xx | `failed` | **crash**, high — the input was not handled |
+| 409, or a 4xx saying "already exists" / "duplicate" / "conflict" | `error` | none — the request collided with data already in the target (happy-path and semantic cases are retried first; see below) |
+| 404 for a sample path value (`id: 1`) that nothing could replace with a real one | `error` | none — the ID probably names nothing, so the case is inconclusive |
 | 2xx to an invalid case | `failed` | **validation_gap**, medium — forbidden input was accepted |
+| 2xx to a semantic case | `failed` | **validation_gap** "suspicious acceptance", with the case's own severity |
 | 401 / 403 / 429 not documented for the case | `error` | none — the request was refused before the API looked at it; usually missing credentials |
-| A code other than the documented one | `failed` | **inconsistency**, low |
+| 404 for a resource the case created a moment earlier | `failed` | **state_bug**, medium — the create said it worked |
+| A 4xx other than the documented one, to an invalid case | `passed` | one **spec_gap** note per operation, low — the rule is enforced; the code differs from the document |
+| A code other than the documented one | `failed` | **spec_gap**, low |
 | Anything else | `passed` | none |
 
-A case with no documented code passes on anything not ruled out above: asserting
-a code the document never promised would manufacture failures. Every finding
-carries its evidence — the request sent, the status, and an excerpt of the body —
-and links to the full `ResponseRecord`.
+Every 2xx to a happy-path or semantic case is then looked inside:
 
-A happy path that answers 404 is reported, with a note: generated sample values
-(`userId: 1`) may simply not exist in your API's data, in which case the finding
-is a false positive to mark as such.
+- **Echo** — each value sent comes back unchanged. Trimming, case, `10.5` as
+  `"10.50"` and a date returned as midnight of that date are accepted; a date
+  shifted by a time zone is not. A difference is a **state_bug**.
+- **Derived fields** — a string the API worked out from the input, such as a
+  name `"2030-20"` from `startYear: 2030, endYear: 2020`, is read the way people
+  write ranges. One that runs backwards, or names a number nothing sent, is a
+  low-confidence **state_bug**.
+- **Response schema** — the body has the documented shape (types, required
+  properties, enums, items). A departure is a **spec_gap**.
+
+Every finding has a category (`crash`, `validation_gap`, `state_bug`,
+`spec_gap`), a confidence (`low`/`medium`/`high`), a
+one-line `probable_cause`, and `reproduction`: the fewest requests that show the
+problem, in order, setup requests included. It also carries its evidence and
+links to the full `ResponseRecord`.
+
+A case with no documented code passes on anything not ruled out above: asserting
+a code the document never promised would manufacture failures.
+
+### Test data that does not collide
+
+The document's `example` values are the ones most likely to exist already in the
+target, so a create sent with them fails for reasons that have nothing to do with
+the request. Fields that look unique — names, codes, titles, years, emails,
+usernames — get fresh values instead: `"MT"` becomes `"MT-3f9a1c"`, a year range
+`2025–2026` becomes, say, `2061–2062` (the range keeps its width, and stays
+inside `minimum`/`maximum`). A field named like an ID (`unitId`) is never
+changed: it points at another record. Values are derived from the run and the
+case name, so re-generating a run reproduces its requests exactly, while two runs
+never share values.
+
+If a happy path still collides — a 409, or a 4xx whose message says it already
+exists — it is sent again with every free-text field freshened, up to three more
+times, and judged on the last attempt. A semantic case that collides is rebuilt
+from a retry seed, so the relation it tests (an end before its start) is applied
+to values the target has not seen. A collision is never reported as "expected
+201"; if the API's 409 is not
+in the document, a single low **spec_gap** note per operation says so. A happy
+path that answers 5xx but succeeds with fresh values is reported as a crash *on
+existing values* (an unhandled unique constraint), not as "500 on happy path".
+
+### Sequences
+
+The happy path of a `GET`, `DELETE`, `PUT` or `PATCH` on `{collection}/{id}`
+never uses the generated sample ID, which may name nothing — or somebody's
+data. When the document has a `POST {collection}`, the case creates a resource
+first (tracked for cleanup like any other), reads its ID from the response
+(`id`, `_id`, `uuid`, or the path parameter's own name), and sends the request
+to that. A `DELETE` that succeeds is then followed by a `GET` of the same ID:
+still readable is a **state_bug**. A create that fails, or answers without an
+ID, leaves the case `error`: an ID is never guessed, and an unexecuted check is
+never a pass. The same goes for every other case of a `PUT`, `PATCH` or
+`DELETE` on the item: it is sent to a record created for it, with its invalid
+body or parameter intact, or `skipped` when no disposable record can be made.
+A `GET` without a `POST` sends the sample value, and a 404 is `error`
+(inconclusive) rather than a finding.
+
+Cleanup deletes only what the run can show it created: a `POST` that answered
+201. A `POST` documented as a create that answers 200 is listed as left behind
+with the reason, because an upsert or find-or-create may have handed back a
+record that existed; it is never deleted.
+
+For every create — a POST documenting 201 — two more cases send several
+requests:
+
+- **`duplicate_create`** sends the same valid body twice. A 409/400 or a second
+  201 passes; a 5xx is a **crash** titled "duplicate create returns 500
+  (unhandled unique constraint)", reproduced by both requests.
+- **`create_read_back`** creates a resource, then reads it with
+  `GET {path}/{id}` (or finds it in `GET {path}`), and checks it holds the values
+  sent. Missing or different is a **state_bug**; in a list that looks paginated
+  the confidence is low.
+
+### Semantic cases
+
+A schema checks fields one at a time, so `{"startYear": 2030, "endYear": 2020}`
+passes it. These cases send schema-valid values that a sensible API should still
+question. Accepting the ones marked *flagged* is a "suspicious acceptance":
+
+| Case | Values | If accepted |
+| --- | --- | --- |
+| `cross_field:a/b:end_before_start` | start/end, from/to, since/until, min/max pairs: end below start | flagged, medium, high confidence |
+| `cross_field:a/b:end_equals_start` | end equal to start (not for min/max) | flagged, low |
+| `cross_field:a/b:end_far_after_start` | end at its maximum, or far beyond start | flagged, low |
+| `suspicious_value:x:negative` / `zero` / `huge` | prices, amounts, quantities — only where the schema allows the value | negative medium; zero and huge low |
+| `suspicious_value:x:far_past` / `far_future` | dates in 1900 / 2999 | flagged, low |
+| `suspicious_value:x:feb_29_non_leap` | `2025-02-29` | flagged, medium |
+| `suspicious_value:x:empty` / `whitespace` | required names, titles, codes | flagged, medium |
+| `suspicious_value:x:very_long` / `unicode` | 5,000 characters (when no `maxLength`) / accented, CJK and symbols | not flagged; a 5xx is a crash and a mangled echo a state_bug |
+
+A semantic case answered with a 4xx passes: the API checks the rule.
+
+### Cleaning up
+
+Every resource a run creates — any 201, or a 2xx to a POST that returned an
+ID — is recorded with how to delete it (`DELETE {path}/{id}`, when the document
+has one). Create a run with `"cleanup": true` (the dashboard's *Clean up
+afterwards*, on by default) and it deletes them when it finishes; or call
+`POST /test-runs/<id>/cleanup/` later. `GET /test-runs/<id>/resources/` lists
+them, a run reports `resources: {deleted, failed, left}`, and the PDF has a
+*Data left behind* section naming what remains and why: no ID in the response,
+no DELETE in the document, or a refused DELETE.
 
 ### Run lifecycle
 
@@ -505,7 +637,21 @@ only on your own machine.
 ### Execution limitations
 
 - Request bodies are sent as JSON, whatever media type the document declares.
-- Response bodies are not yet validated against the documented response schema.
+- Response bodies are checked against the schema of the lowest documented 2xx
+  only, and the checker understands types, required properties, enums, items and
+  compositions — not formats, patterns or `additionalProperties`.
+- Semantic cases are heuristics on field names: a range spelled `opensAt` and
+  `closesAt`, or a uniqueness rule on a field that does not look unique, is not
+  recognised (the retry still catches the latter on a happy path).
+- Every case of a `PUT`, `PATCH` or `DELETE` on `{collection}/{id}`, and the
+  happy path of a `GET`, first creates a disposable record through
+  `POST {collection}` and addresses that; the case keeps whatever it
+  deliberately breaks. A mutating request is never sent to the sample path
+  value: when the collection has no `POST`, the create answers something
+  other than 201 (an upsert may return an existing record), or the case breaks
+  the ID itself with a number, the case is `skipped` with the reason. A `GET`'s
+  other cases are read-only and still use the sample value. An API that creates
+  under a different path is not recognised.
 - A run stuck in `running` because its worker died stays there; there is no
   cancel or retry yet.
 - The same credentials are used for every case: there are no authentication or
