@@ -226,9 +226,19 @@ pytest
 ```
 
 Tests run against `config/settings_test.py`, which supplies the required
-environment variables before importing the real settings — so the suite needs
-neither a `.env` file nor a running PostgreSQL (the health check does not use the
-database).
+environment variables before importing the real settings — so the suite needs no
+`.env` file. It does need a running PostgreSQL whose role may create databases
+(see [Running on the host](#running-on-the-host)); Redis is not used.
+
+```bash
+cd frontend
+npm test            # vitest
+npm run build       # type check and production build
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs all of this on every pull
+request and every push to `main`: the backend suite against a PostgreSQL 16
+service, `makemigrations --check`, and the frontend tests and build.
 
 ## API
 
