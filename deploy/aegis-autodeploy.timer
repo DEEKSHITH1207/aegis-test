@@ -1,0 +1,11 @@
+# Checks for a new commit every five minutes.
+
+[Unit]
+Description=Check for a new AegisTest commit every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

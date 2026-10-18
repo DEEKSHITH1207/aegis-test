@@ -1,0 +1,10 @@
+# Context for deploy/Dockerfile.caddy (the repository root). The backend
+# image is built from backend/ and uses backend/.dockerignore.
+.git
+.env
+.env.*
+**/node_modules
+**/dist
+backend
+docs
+examples

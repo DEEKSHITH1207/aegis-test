@@ -110,6 +110,73 @@ sudo -u postgres createdb --owner aegis aegis
 `--createdb` is required for the test suite, not for the application: pytest
 creates and drops a separate `test_aegis` database on every run.
 
+## Deploying to a server
+
+`docker-compose.prod.yml` runs everything on one Linux server with Docker,
+behind [Caddy](https://caddyserver.com) (`deploy/Caddyfile`):
+
+```
+browser ──HTTPS──> Caddy ── shared login ──┬── /api/*  → Django (gunicorn) ─┬─ PostgreSQL
+                                           └── else    → built dashboard    ├─ Redis
+                                                                            └─ Celery worker
+```
+
+Only Caddy publishes ports (80 and 443). The code is built into the images
+rather than mounted, Django runs with `DEBUG=False`, and a one-off `migrate`
+service applies migrations before Django and the worker start.
+
+```bash
+cp .env.prod.example .env       # fill in every value
+docker run --rm caddy:2.8-alpine caddy hash-password --plaintext 'team-password'
+                                # paste the output into BASIC_AUTH_HASH, in single quotes
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+- **Login.** AegisTest has no accounts, so Caddy asks for one shared username
+  and password before anything is served — the dashboard and the API alike.
+  Caddy drops the `Authorization` header before passing a request to Django,
+  which would otherwise try the login as a Django user and refuse it.
+- **HTTPS.** Set `SITE_ADDRESS` to a domain whose DNS points at the server, and
+  Caddy obtains and renews a Let's Encrypt certificate. `SITE_ADDRESS=:80`
+  serves plain HTTP on the server's IP for a first test; the password is then
+  sent unencrypted.
+- **Targets.** Runs are sent from the server, so the APIs under test must be
+  reachable from it — its `localhost` is not yours. Set
+  `EXECUTOR_ALLOWED_HOSTS` to your staging and test hosts.
+- **Admin.** `/admin/` is not exposed; only `/api/` reaches Django.
+
+To update by hand: `git pull`, then the same `up -d --build`.
+
+### Deploying automatically
+
+A systemd timer on the server checks `main` every five minutes and, when it
+has moved, fast-forwards the checkout and runs the same `up -d --build`
+(`deploy/autodeploy.sh`). The server pulls; nothing pushes to it, so SSH can
+stay closed to everyone but you and GitHub holds no key to the server. It
+fetches with the repository's read-only deploy key.
+
+```bash
+# On the server, with the repository cloned to /home/ubuntu/aegis-test
+sudo cp deploy/aegis-autodeploy.service deploy/aegis-autodeploy.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now aegis-autodeploy.timer
+
+systemctl list-timers aegis-autodeploy.timer   # when it next runs
+journalctl -u aegis-autodeploy -f              # what each run did
+sudo systemctl start aegis-autodeploy          # check right now
+```
+
+- **What gets deployed.** Whatever reaches `main`. The timer does not wait
+  for CI, so protect `main` on GitHub (require the CI checks to pass before
+  merging) and only tested code arrives.
+- **Another branch.** `sudo systemctl edit aegis-autodeploy.service`, then add
+  `[Service]` and `Environment=AUTODEPLOY_BRANCH=the-branch`.
+- **When it refuses.** A checkout that cannot fast-forward (a commit made on
+  the server, a force push to `main`) is left untouched and the run fails in
+  the journal; sort out the checkout by hand.
+- **A forced rebuild** without a new commit: `deploy/autodeploy.sh --force`.
+- **Pausing.** `sudo systemctl stop aegis-autodeploy.timer`; `start` resumes.
+
 ## Dashboard
 
 `frontend/` is a React + TypeScript app (Vite). From it a user:
