@@ -7,8 +7,8 @@
 | Django + DRF   | HTTP API, validation, persistence, orchestration of test runs      |
 | PostgreSQL     | System of record: specs, test cases, requests, responses, findings |
 | Redis          | Celery broker and result backend                                   |
-| Celery worker  | Long-running work: executing API tests, LLM analysis (later)       |
-| React frontend | Dashboard for test runs and findings (later)                       |
+| Celery worker  | Long-running work: executing API tests, LLM analysis               |
+| React frontend | Dashboard: upload specs, run tests, read findings, download PDFs   |
 
 ## Code layout
 
@@ -21,7 +21,8 @@ infrastructure: the health endpoint and the DRF exception handler that turns a
 service-layer validation error into a 400 rather than a 500.
 
 `apps.testing` owns the product domain — specifications, endpoints, runs, cases,
-evidence and findings — plus `openapi.py`, which reads specification documents. It is a single app rather than one app per model because
+evidence and findings — plus two pure modules: `openapi.py`, which reads
+specification documents, and `generator.py`, which decides what to test. It is a single app rather than one app per model because
 these seven models form one tightly connected graph with one lifecycle: they are
 always queried together and a specification's deletion removes all of them.
 Splitting them would create circular dependencies between apps and buy nothing.
@@ -61,9 +62,10 @@ alongside `v1` rather than breaking existing clients.
 
 `config/celery.py` defines the Celery app and reads its configuration from
 Django settings via the `CELERY_` namespace, so there is a single place to
-configure the queue. There are still no tasks and no worker service — those
-arrive with the test executor, when there is real work to run. Phase 2 added the
-data model those tasks will write to, not the tasks themselves.
+configure the queue. The one task, `apps/testing/tasks.py`, executes a test
+run; the `worker` service in `docker-compose.yml` consumes it. The task is a
+thin wrapper around `services.execute_test_run`, which the
+`execute_test_run` management command also calls directly.
 
 ## Domain model
 
@@ -152,3 +154,245 @@ Only `source_type` is copied back onto the specification from the document. Name
 and version are not: they identify the specification and are covered by a unique
 constraint, so overwriting them from a file could collide with another row or
 rename something a user is already working with.
+
+## Generating test cases
+
+```
+View  →  Service  →  Generator  →  TestCase rows
+```
+
+`apps/testing/generator.py` is pure in the same way `openapi.py` is: it reads an
+Endpoint's fields and returns dataclasses. It opens no database connection and
+imports nothing that can reach the network — a test asserts the latter against
+the module's own import list, because the whole point of this phase is that it
+describes requests without making any. Persistence stays in the service.
+
+Two properties do the real work.
+
+**Deterministic.** No randomness, no clock. The same schema always produces the
+same cases with the same names and values, which is what makes re-generation
+comparable and a failure reproducible. Property names are sorted before use, so
+the output does not depend on the key order a JSON column happens to return.
+
+**One violation per case.** An invalid case breaks exactly one rule and is
+otherwise a valid request. A body missing a field *and* carrying a malformed
+email cannot tell you which one the API rejected, and a case whose input is
+secretly valid reports a bug that does not exist. That second risk is why
+`pattern` is skipped with a warning rather than guessed at, why an enum gets no
+separate type case, and why a nullable field gets no null case.
+
+### Expected status codes
+
+`parse` keeps only the success *schema*, because that is what an Endpoint
+stores — the response codes themselves are not on the model. They are read back
+out of the stored document by `openapi.documented_status_codes` at generation
+time, which keeps the decision out of the import and off the schema.
+
+The rule is never to invent one: the lowest documented 2xx for a happy path;
+400, then 422, then the lowest other 4xx for a rejected request; and `null` when
+the document promises neither. `TestCase.expected_status_code` is nullable for
+exactly this reason. A null expectation is not a gap — a case with no documented
+answer still records what the API did, and a 5xx is a finding whatever the
+document says.
+
+### Identity and re-generation
+
+A generated case is identified by `(test_run, endpoint, name)`, and its name is
+deterministic, so a second pass matches the rows it wrote the first time and
+updates them in place. No database constraint enforces this: generation is the
+only writer of these names, and a hand-authored case should not be forbidden
+from reusing one. The service owns the rule, and a test asserts that generating
+three times leaves the row count unchanged.
+
+Only the fields generation produces are rewritten, so a value set by any other
+means survives. The pass is one transaction: a run half-populated with test
+cases would be executed as though it were complete, and would under-report.
+
+Generation is refused unless the run is `pending`. Adding cases to a run that has
+already executed would silently change what its results mean.
+
+## Executing a run
+
+```
+View ─ start_execution ─(on commit)→ Celery task ─ execute_test_run
+                                                     │ per case (one request, or a sequence):
+                                     executor.prepare → executor.send   (sent again, up to 3×,
+                                                       on a collision: refreshed_input for a
+                                                       happy path, retry_input for a semantic case)
+                                                     │ a case on {collection}/{id} (every PUT/
+                                                       PATCH/DELETE case, a GET's happy path):
+                                                       POST the collection first, use its ID,
+                                                       or skip it when nothing disposable exists
+                                                     → RequestRecord / ResponseRecord
+                                                     → CreatedResource for each create
+                                     evaluation.evaluate / duplicate_create / read_back
+                                       + oracles (echo, derived fields, schema)
+                                                     → TestCase.status, Findings
+                                                     │ then, if run.cleanup:
+                                     cleanup_test_run → DELETE each CreatedResource
+```
+
+Generation goes through `semantic.build_test_cases`, which wraps the
+generator: it gives likely-unique fields fresh values derived from the run's
+seed and the case name (so a run still regenerates identically), and adds the
+cross-field, suspicious-value and sequence cases. `oracles.py` is pure too: it
+reads a response body (echo, derived fields, response schema, conflicts, IDs).
+
+Three modules, each with one job:
+
+- `executor.py` is the **only** module that reaches the network. It builds a
+  request from a case's `input_data`, sends it, and returns what came back.
+  It never raises for anything the target does — a timeout or refused
+  connection is a result, not an exception — so one bad case cannot end a run.
+- `evaluation.py` is pure: status code and expectation in, verdict and
+  finding drafts out. The rules live in one function and are tested as plain
+  calls.
+- `services.py` sequences them and owns persistence.
+
+**Starting is separate from executing.** `start_execution` locks the run,
+checks it is pending, has a usable base URL and has cases, and moves it to
+`running` in one transaction; the task is queued `on_commit`, so a worker never
+picks up a run that is still pending. If queueing itself fails — Redis is down
+— the run is marked `failed` rather than left `running` with nothing working
+on it.
+
+**Each case commits on its own.** Progress is visible while a run executes,
+and a crash loses only the case in flight. A run does not execute twice:
+re-running would mix two sets of evidence under one set of cases.
+
+**Evidence is recorded before it is judged,** and credentials are redacted
+before they are recorded. A run's `headers` stay in the database so the worker
+can send them, but never appear in a response, a `RequestRecord` or a finding.
+
+**Unreachable targets stop early.** If the first three requests cannot
+connect, every remaining case would wait out the same failure; the run stops
+with the rest `skipped`. Once the target has answered, a later connection
+failure is recorded against its case and the run continues — an API that falls
+over mid-run is itself worth seeing.
+
+### Why 401, 403 and 429 are not verdicts
+
+A case exists to test one rule. A request refused for missing credentials, or
+rate-limited, never reached the code that enforces that rule, so passing or
+failing it would be claiming something the response does not show. Such cases
+are `error`, with a detail pointing at the run's headers.
+
+### Outbound requests
+
+Executing a run makes the server send requests to a host its caller chose.
+That is the product, but combined with an API that has no authentication it is
+also a server-side request forgery surface. `EXECUTOR_ALLOWED_HOSTS` restricts
+the hosts a run may target and is checked when the run is created and again
+when it executes. Redirects are not followed, so an allowed host cannot bounce a
+request to one that is not.
+
+## Business rules
+
+```
+rules file ─ document.load ─→ RulesDocument   (pure: parsed, checked up front)
+                                   │
+            runner.run ── executor ──→ API     (network; persists nothing)
+                                   │
+                              RunResult
+                                   │
+       services._record_rules_result ──→ RulesRun, ScenarioResult,
+                                          RuleExchange, Finding
+```
+
+`apps/testing/rules/` holds four modules. `document`, `expressions` and
+`timeline` are pure. `runner` sends requests — through `executor`, so the
+same redirect, size and timeout rules apply — but writes nothing: it returns
+a `RunResult`, and the service records it in one transaction. The split keeps
+the runner testable with a mock transport and no database, and keeps the
+persistence rules in `services.py` with the rest.
+
+**Setup values are never persisted.** They enter through the command's
+environment or the API request, reach the worker as task arguments, and live
+in memory for the run. The runner scrubs secret ones, and the login token,
+from every exchange before returning it, so nothing the service writes can
+contain them. The file's text *is* stored on the run: what a run checked
+cannot change after the fact.
+
+**A rule that cannot be checked is not a rule that passed.** A missing field,
+a failed follow-up request or an expression error makes the check `unchecked`
+and the scenario `error`. Only a comparison that ran and failed is a
+`business_rule_violation`.
+
+**Findings have exactly one source.** `Finding.test_case` became nullable
+and `Finding.scenario_result` was added, with a check constraint that exactly
+one is set. Existing findings and `/test-runs/<id>/findings/` are unchanged.
+
+**Deterministic by construction.** `today` is fixed when the run starts and
+may be overridden; expression working lists variables in the order written,
+not in set order, so the same file and date give the same requests and the
+same finding text.
+
+## LLM analysis
+
+```
+View ─ start_analysis ─(on commit)→ Celery task ─ execute_analysis
+                                                    │ per batch of findings:
+                                    prompts.brief → client.Analyst.ask → prompts.parse_assessments
+                                                    → FindingAssessment rows (one commit per batch)
+                                    then prompts.summary_prompt → parse_summary → Analysis.summary, groups
+```
+
+`apps/testing/analysis/` repeats the split used for execution and rules.
+`prompts.py` is pure: it turns loaded findings into the text the model reads
+and turns a reply back into checked dataclasses; a test asserts it imports
+nothing that can reach the network. `client.py` is the only module that talks
+to Anthropic, and it turns every way a request can fail — an API error, a
+refusal, a reply cut off at the token limit — into one `AnalystError`.
+`services.py` sequences them and owns persistence.
+
+**The model is never the source of truth.** This is the rule the README
+states, and the schema enforces it: an analysis writes `Analysis` and
+`FindingAssessment` rows and has no code path that writes a `Finding`. The
+deterministic verdicts remain the record, and the model's opinion sits beside
+them for a person to weigh. It also bounds prompt injection. Evidence is text
+the API under test chose, so a hostile API could try to steer the model, but
+the most it can reach is an advisory row.
+
+**A reply is checked, not trusted.** Structured outputs guarantee the reply's
+shape. They cannot guarantee that it refers to the right rows. Each
+assessment must name a finding that was in its batch, only the first
+assessment of a finding counts, and a group may cite only assessed findings.
+Anything else is dropped into `warnings`, so a hallucinated ID cannot attach a
+conclusion to the wrong finding.
+
+**Opt-in, because it leaves the building.** An analysis sends response bodies
+from the API under test to a third party and costs money, so
+`LLM_ANALYSIS_ENABLED` is off by default and nothing runs until someone
+asks for it. What is sent is built from stored rows, which were redacted when
+they were written. A run's headers and a rules run's setup values are never
+stored on those rows, so they cannot be sent.
+
+**Batches keep requests bounded.** Findings go most severe first, so a cap
+(`LLM_MAX_FINDINGS`) drops the least important. A run small enough for one
+batch is assessed and summarised in a single request; a larger one is
+summarised in a final request that reads only each assessment's digest, not
+the evidence again. Requests stream, so a large output ceiling for adaptive
+thinking cannot run into an HTTP timeout.
+
+## Dashboard and reports
+
+`frontend/` is a single-page React app that only talks to `/api/v1/`. It holds
+no rules of its own: it uploads, starts and polls, and renders what the API
+returns. The Vite dev server proxies `/api`, keeping one origin and leaving the
+API free of CORS configuration while it has no authentication.
+
+**Upload is one transaction.** `services.upload_specification` decodes the
+file (JSON, else YAML), creates the specification and imports it; a document
+that cannot be imported leaves nothing behind. YAML anchors and aliases are
+refused, because a small file of nested aliases expands into a huge document
+once it is copied into a JSON column.
+
+**The PDF is rendered on the server.** `apps/testing/report.py` is pure: it
+takes a `RunReport` of dataclasses and returns bytes, and
+`services.test_run_report` assembles that from the database. A report
+therefore looks the same whoever downloads it, can be fetched by a script or
+attached to an email without a browser, and cannot contain anything the API
+itself would not return. All text is escaped before ReportLab's paragraph
+markup reads it, since a response body is arbitrary text chosen by the API
+under test.
+

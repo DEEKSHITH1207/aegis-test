@@ -12,9 +12,16 @@ from typing import Any
 
 from rest_framework import serializers
 
+from apps.testing import openapi, services
 from apps.testing.models import (
+    Analysis,
+    CreatedResource,
     Endpoint,
     Finding,
+    FindingAssessment,
+    RuleExchange,
+    RulesRun,
+    ScenarioResult,
     Specification,
     TestCase,
     TestRun,
@@ -22,6 +29,11 @@ from apps.testing.models import (
 
 
 class SpecificationSerializer(serializers.ModelSerializer):
+    endpoint_count = serializers.SerializerMethodField()
+    # Where the document says the API is served; a starting point for a run's
+    # base URL, never used without the user seeing it.
+    suggested_base_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Specification
         fields = [
@@ -31,10 +43,20 @@ class SpecificationSerializer(serializers.ModelSerializer):
             "source_type",
             "raw_specification",
             "version",
+            "endpoint_count",
+            "suggested_base_url",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_endpoint_count(self, specification: Specification) -> int:
+        if hasattr(specification, "endpoint_count"):
+            return specification.endpoint_count
+        return specification.endpoints.count()
+
+    def get_suggested_base_url(self, specification: Specification) -> str:
+        return openapi.suggested_base_url(specification.raw_specification)
 
     def validate_name(self, value: str) -> str:
         # A name of spaces passes CharField's blank check but is not a name.
@@ -58,6 +80,7 @@ class EndpointSerializer(serializers.ModelSerializer):
             "parameters",
             "request_schema",
             "response_schema",
+            "tags",
             "created_at",
             "updated_at",
         ]
@@ -69,14 +92,43 @@ class TestRunSerializer(serializers.ModelSerializer):
     # specification. Status and the timestamps are driven by the run's
     # lifecycle, never set by the client.
     name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    # Headers usually carry credentials, so they are accepted but never
+    # returned. Their names are, so a client can see what is configured.
+    headers = serializers.DictField(
+        child=serializers.CharField(allow_blank=True), required=False, write_only=True
+    )
+    header_names = serializers.SerializerMethodField()
+    results = serializers.SerializerMethodField()
+    specification_name = serializers.CharField(source="specification.name", read_only=True)
+    # Limit the run to part of the API: endpoint IDs, and/or tags (sections)
+    # whose endpoints are all included. Neither means every endpoint.
+    endpoints = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Endpoint.objects.all(), required=False
+    )
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=100), required=False, write_only=True
+    )
+    scope = serializers.SerializerMethodField()
+    resources = serializers.SerializerMethodField()
 
     class Meta:
         model = TestRun
         fields = [
             "id",
             "specification",
+            "specification_name",
             "name",
+            "base_url",
+            "headers",
+            "header_names",
+            "endpoints",
+            "tags",
+            "scope",
+            "cleanup",
+            "resources",
             "status",
+            "status_detail",
+            "results",
             "started_at",
             "completed_at",
             "created_at",
@@ -85,11 +137,25 @@ class TestRunSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id",
             "status",
+            "status_detail",
             "started_at",
             "completed_at",
             "created_at",
             "updated_at",
         ]
+
+    def get_header_names(self, test_run: TestRun) -> list[str]:
+        return sorted(test_run.headers) if isinstance(test_run.headers, dict) else []
+
+    def get_results(self, test_run: TestRun) -> dict[str, int]:
+        return services.summarise_test_run(test_run)
+
+    def get_scope(self, test_run: TestRun) -> dict[str, Any]:
+        return services.describe_scope(test_run)
+
+    def get_resources(self, test_run: TestRun) -> dict[str, int]:
+        summary = services.summarise_resources(test_run)
+        return {"deleted": summary.deleted, "failed": summary.failed, "left": summary.left}
 
 
 class TestCaseSerializer(serializers.ModelSerializer):
@@ -104,11 +170,13 @@ class TestCaseSerializer(serializers.ModelSerializer):
             "test_type",
             "input_data",
             "expected_status_code",
+            "oracle",
             "status",
+            "status_detail",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "status", "created_at", "updated_at"]
+        read_only_fields = ["id", "status", "status_detail", "created_at", "updated_at"]
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         test_run = attrs.get("test_run")
@@ -126,17 +194,44 @@ class FindingSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "test_case",
+            "scenario_result",
             "response_record",
             "title",
             "description",
             "severity",
             "category",
+            "confidence",
+            "probable_cause",
+            "reproduction",
             "evidence",
             "status",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class CreatedResourceSerializer(serializers.ModelSerializer):
+    endpoint_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CreatedResource
+        fields = [
+            "id",
+            "test_case",
+            "endpoint",
+            "endpoint_label",
+            "resource_id",
+            "delete_url",
+            "status",
+            "detail",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_endpoint_label(self, resource: CreatedResource) -> str:
+        return f"{resource.endpoint.method} {resource.endpoint.path}"
 
 
 class SkippedOperationSerializer(serializers.Serializer):
@@ -182,3 +277,177 @@ class ImportResultSerializer(serializers.Serializer):
 
     def get_unchanged(self, result) -> int:
         return len(result.unchanged)
+
+
+class GenerationResultSerializer(serializers.Serializer):
+    """The outcome of generating a run's test cases.
+
+    Counts rather than the cases themselves: a specification of any size
+    produces hundreds, and they are already listable on the run.
+    """
+
+    test_run_id = serializers.IntegerField()
+    endpoints = serializers.IntegerField()
+    created = serializers.IntegerField()
+    updated = serializers.IntegerField()
+    unchanged = serializers.IntegerField()
+    skipped = serializers.IntegerField()
+    warnings = serializers.ListField(child=serializers.CharField())
+
+
+class RulesRunCreateSerializer(serializers.Serializer):
+    """A request to run a business-rules file.
+
+    ``setup`` carries the values the file asks for — IDs, credentials. They
+    are handed to the run and never stored, so they are write-only and absent
+    from every response.
+    """
+
+    specification = serializers.PrimaryKeyRelatedField(queryset=Specification.objects.all())
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    base_url = serializers.CharField(max_length=2000)
+    rules = serializers.CharField(trim_whitespace=False)
+    setup = serializers.DictField(
+        child=serializers.CharField(allow_blank=True), required=False, default=dict
+    )
+    # Sets the dates the requests carry. It cannot move the server's clock.
+    today = serializers.DateField(required=False, allow_null=True, default=None)
+
+
+class RulesRunSerializer(serializers.ModelSerializer):
+    rules = serializers.CharField(source="rules_text", read_only=True)
+    results = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RulesRun
+        fields = [
+            "id",
+            "specification",
+            "name",
+            "base_url",
+            "rules",
+            "status",
+            "status_detail",
+            "today",
+            "today_overridden",
+            "warnings",
+            "results",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_results(self, rules_run: RulesRun) -> dict[str, int]:
+        return services.summarise_rules_run(rules_run)
+
+
+class ScenarioResultSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ScenarioResult
+        fields = [
+            "id",
+            "rules_run",
+            "position",
+            "name",
+            "status",
+            "steps_run",
+            "detail",
+            "checks",
+            "cleanup_problems",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class RuleExchangeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RuleExchange
+        fields = [
+            "id",
+            "rules_run",
+            "scenario_result",
+            "position",
+            "phase",
+            "name",
+            "method",
+            "url",
+            "request_headers",
+            "query_params",
+            "request_body",
+            "status_code",
+            "response_headers",
+            "response_body",
+            "response_time_ms",
+            "error",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class AnalysisSerializer(serializers.ModelSerializer):
+    results = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Analysis
+        fields = [
+            "id",
+            "test_run",
+            "rules_run",
+            "status",
+            "status_detail",
+            "model",
+            "effort",
+            "summary",
+            "groups",
+            "warnings",
+            "findings_total",
+            "findings_selected",
+            "results",
+            "usage",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_results(self, analysis: Analysis) -> dict[str, int]:
+        return services.summarise_analysis(analysis)
+
+
+class FindingAssessmentSerializer(serializers.ModelSerializer):
+    # The finding's own title and severity, so an assessment reads on its own
+    # and a suggested severity can be compared without a second request.
+    finding_title = serializers.CharField(source="finding.title", read_only=True)
+    finding_severity = serializers.CharField(source="finding.severity", read_only=True)
+    finding_category = serializers.CharField(source="finding.category", read_only=True)
+
+    class Meta:
+        model = FindingAssessment
+        fields = [
+            "id",
+            "analysis",
+            "finding",
+            "finding_title",
+            "finding_severity",
+            "finding_category",
+            "verdict",
+            "confidence",
+            "suggested_severity",
+            "reasoning",
+            "likely_cause",
+            "recommendation",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class SpecificationUploadSerializer(serializers.Serializer):
+    """An OpenAPI or Swagger file, JSON or YAML. Name and version default to
+    the document's info.title and info.version."""
+
+    file = serializers.FileField()
+    name = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    version = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")

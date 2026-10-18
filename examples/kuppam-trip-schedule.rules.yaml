@@ -1,0 +1,127 @@
+# Kuppam trip schedule - totals
+#
+# Checks that a water-transportation trip schedule's totalTrips counts each day
+# at the rate that applied that day, across a create, a remarks-only edit and a
+# mid-schedule rate change.
+#
+# Run against the Kuppam backend (base URL http://localhost:4000/sklc) with
+#   python manage.py run_rules --specification <id> \
+#     --rules examples/kuppam-trip-schedule.rules.yaml \
+#     --base-url http://localhost:4000/sklc --env-file examples/kuppam.env
+#
+# The schedule window is today-4d .. today+3d: 8 days, 4 before today and 4
+# from today. Run it without --today: the server works from its own date.
+
+version: 1
+timezone: Asia/Kolkata
+
+setup:
+  AE_USERNAME: {env: AE_USERNAME}
+  AE_PASSWORD: {env: AE_PASSWORD, secret: true}
+  WATER_REQUIREMENT_ID:
+    env: WATER_REQUIREMENT_ID
+    description: MPDO-approved; its supply period covers today-4d..today+3d
+  DRIVER_ID:
+    env: DRIVER_ID
+    description: Mapped to that habitation's gram panchayat
+  WATER_SUPPLIER_ID:
+    env: WATER_SUPPLIER_ID
+    description: That driver's tanker owner
+
+variables:
+  FROM: ${today - 4d}
+  TO: ${today + 3d}
+
+# Trips per day over the schedule. The create step starts it at 2 a day for the
+# whole window; raise_rate changes it to 4 from today, which closes the rate-2
+# period at today-1d and keeps the window's end.
+timelines:
+  trips:
+    - {from: FROM, to: TO, rate: 2}
+
+auth:
+  method: POST
+  path: /auth/login
+  body: {username: "${AE_USERNAME}", password: "${AE_PASSWORD}"}
+  token: $.data.accessToken
+
+scenarios:
+  - name: rate_raised_mid_schedule
+    description: Rate raised mid-schedule.
+    steps:
+      - name: create
+        method: POST
+        path: /water-transportation/trip-schedule
+        body:
+          # The API documents these IDs as numbers.
+          waterRequirementId: ${int(WATER_REQUIREMENT_ID)}
+          fromDate: ${FROM}
+          toDate: ${TO}
+          drivers:
+            - driverId: ${int(DRIVER_ID)}
+              waterSupplierId: ${int(WATER_SUPPLIER_ID)}
+              tripsPerDay: 2
+        expect: 201
+        save:
+          scheduleId: $.data.id
+          # TS-2 compares the remarks-only edit against this.
+          totalTripsAfterCreate: $.data.totalTrips
+
+      - name: edit_remarks_only
+        method: PATCH
+        path: /water-transportation/trip-schedule/{scheduleId}
+        body: {remarks: aegis check, changeReason: remarks only}
+        expect: 200
+
+      - name: raise_rate
+        method: PATCH
+        path: /water-transportation/trip-schedule/{scheduleId}
+        body:
+          drivers:
+            - driverId: ${int(DRIVER_ID)}
+              waterSupplierId: ${int(WATER_SUPPLIER_ID)}
+              tripsPerDay: 4
+          changeReason: rate raised to 4 from today
+        expect: 200
+        timeline:
+          trips: {from: today, rate: 4}
+
+    rules:
+      - name: "TS-1: totalTrips counts each day at the rate that applied that day"
+        severity: high
+        why: >-
+          When the rate changes mid-schedule, the days before the change keep
+          their old rate. totalTrips = the sum over the schedule's periods of
+          (days x rate). Days before the schedule was created count at the rate
+          it was created with.
+        # No `after`: checked after every step.
+        fetch: {method: GET, path: "/water-transportation/trip-schedule/{scheduleId}"}
+        actual: $.data.totalTrips
+        expected: sum_over_periods(trips)
+
+      - name: "TS-2: an edit that doesn't touch dates or rates doesn't change totalTrips"
+        severity: high
+        why: Changing only remarks cannot change how many trips the schedule holds.
+        after: [edit_remarks_only]
+        actual: $.data.totalTrips
+        expected: totalTripsAfterCreate
+
+      - name: "TS-3: history snapshot matches the schedule"
+        severity: medium
+        why: The newest history row's next.totalTrips must equal the schedule's totalTrips.
+        fetch:
+          history: {method: GET, path: "/water-transportation/trip-schedule/{scheduleId}/history"}
+          schedule: {method: GET, path: "/water-transportation/trip-schedule/{scheduleId}"}
+        actual: jsonpath(history, '$.data[0].next.totalTrips')
+        expected: jsonpath(schedule, '$.data.totalTrips')
+
+      - name: "TS-4: tripsPerDay is the sum of the drivers' shares"
+        severity: medium
+        why: A schedule's tripsPerDay is the sum of its drivers' tripsPerDay.
+        actual: $.data.tripsPerDay
+        expected: sum([driver['tripsPerDay'] for driver in response['data']['drivers']])
+
+    cleanup:
+      - name: delete_schedule
+        method: DELETE
+        path: /water-transportation/trip-schedule/{scheduleId}

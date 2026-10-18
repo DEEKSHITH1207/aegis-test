@@ -112,6 +112,46 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 
+# In development without a worker, set this to run tasks inside the request
+# that queues them. A whole test run then executes before the response returns.
+CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", default=False)
+
+# --- Test execution -----------------------------------------------------------
+
+# Seconds to wait for the target to connect and answer each request.
+EXECUTOR_TIMEOUT_SECONDS = float(env("EXECUTOR_TIMEOUT_SECONDS", "10"))
+# Response bodies are read up to this size; the rest is discarded.
+EXECUTOR_MAX_RESPONSE_BYTES = int(env("EXECUTOR_MAX_RESPONSE_BYTES", "1048576"))
+# Set to false only to test an API served with a self-signed certificate.
+EXECUTOR_VERIFY_TLS = env_bool("EXECUTOR_VERIFY_TLS", default=True)
+# Hosts a run may send requests to. Empty allows any host. Anyone who can reach
+# this API can make the server issue requests to any host it can reach, so set
+# this on any deployment that is not a single user's machine. A leading dot
+# allows subdomains: ".example.com".
+EXECUTOR_ALLOWED_HOSTS = env_list("EXECUTOR_ALLOWED_HOSTS", "")
+
+# Largest specification file accepted by the upload endpoint.
+SPEC_UPLOAD_MAX_BYTES = int(env("SPEC_UPLOAD_MAX_BYTES", "5242880"))
+
+# --- LLM analysis -------------------------------------------------------------
+
+# Off by default. An analysis sends a run's findings and evidence — request
+# and response bodies from the API under test — to Anthropic, and every one
+# costs money, so a deployment opts in. Credentials are not settings: the
+# Anthropic SDK reads ANTHROPIC_API_KEY from the environment.
+LLM_ANALYSIS_ENABLED = env_bool("LLM_ANALYSIS_ENABLED", default=False)
+LLM_MODEL = env("LLM_MODEL", "claude-opus-5")
+# low | medium | high | xhigh | max. Empty leaves the model's default.
+LLM_EFFORT = env("LLM_EFFORT", "high")
+# Re-run a request the model's safety classifiers decline on Anthropic's
+# recommended fallback model. Turn off for a model that does not support it.
+LLM_REFUSAL_FALLBACK = env_bool("LLM_REFUSAL_FALLBACK", default=True)
+# Findings sent per request, and at most per analysis (most severe first).
+LLM_FINDINGS_PER_REQUEST = int(env("LLM_FINDINGS_PER_REQUEST", "20"))
+LLM_MAX_FINDINGS = int(env("LLM_MAX_FINDINGS", "200"))
+LLM_TIMEOUT_SECONDS = float(env("LLM_TIMEOUT_SECONDS", "600"))
+LLM_MAX_RETRIES = int(env("LLM_MAX_RETRIES", "3"))
+
 # --- REST framework -----------------------------------------------------------
 
 REST_FRAMEWORK = {
@@ -157,4 +197,6 @@ LOGGING = {
         "console": {"class": "logging.StreamHandler", "formatter": "simple"},
     },
     "root": {"handlers": ["console"], "level": env("DJANGO_LOG_LEVEL", "INFO")},
+    # httpx logs every request at INFO; a test run sends hundreds.
+    "loggers": {"httpx": {"level": "WARNING"}, "httpx2": {"level": "WARNING"}},
 }

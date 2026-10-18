@@ -62,6 +62,8 @@ class ParsedOperation:
     parameters: list[dict[str, Any]] = field(default_factory=list)
     request_schema: dict[str, Any] | None = None
     response_schema: dict[str, Any] | None = None
+    # The sections the document files the operation under, in its order.
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,71 @@ def parse(document: Any) -> ParsedDocument:
         skipped=skipped,
         warnings=warnings,
     )
+
+
+def suggested_base_url(document: Any) -> str:
+    """Where the document says its API is served, or "" when it does not say.
+
+    OpenAPI 3 lists ``servers``; Swagger 2 splits the URL into ``schemes``,
+    ``host`` and ``basePath``. A relative server URL or one with template
+    variables (``https://{region}.example.com``) cannot be used as it stands,
+    so it is not suggested.
+    """
+    if not isinstance(document, dict):
+        return ""
+    servers = document.get("servers")
+    if isinstance(servers, list) and servers:
+        first = servers[0]
+        url = first.get("url") if isinstance(first, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")) and "{" not in url:
+            return url.rstrip("/")
+        return ""
+    host = document.get("host")
+    if isinstance(host, str) and host and "{" not in host:
+        schemes = document.get("schemes")
+        scheme = "https"
+        if isinstance(schemes, list) and schemes and "https" not in schemes:
+            scheme = str(schemes[0])
+        base_path = document.get("basePath")
+        base_path = base_path if isinstance(base_path, str) else ""
+        return f"{scheme}://{host}{base_path}".rstrip("/")
+    return ""
+
+
+def documented_status_codes(document: Any, path: str, method: str) -> list[str]:
+    """The response codes a document declares for one operation.
+
+    ``parse`` keeps only the success *schema*, because that is what an Endpoint
+    stores; the codes themselves are needed later, when deciding what a test
+    case should expect. Reading them back out of the stored document keeps that
+    decision out of the import and off the model.
+
+    Returns an empty list for anything it cannot find, including a document that
+    would not parse: an absent expectation is the correct answer here, and an
+    exception would turn "this API documents nothing" into a failure.
+    """
+    if not isinstance(document, dict):
+        return []
+
+    paths = document.get("paths")
+    if not isinstance(paths, dict):
+        return []
+
+    path_item = paths.get(path)
+    if not isinstance(path_item, dict):
+        return []
+
+    operation = path_item.get(method.lower())
+    if not isinstance(operation, dict):
+        operation = path_item.get(method.upper())
+    if not isinstance(operation, dict):
+        return []
+
+    responses = operation.get("responses")
+    if not isinstance(responses, dict):
+        return []
+
+    return [code for code in responses if isinstance(code, str)]
 
 
 # --- Document-level validation ------------------------------------------------
@@ -286,7 +353,24 @@ def _parse_operation(
         parameters=parameters,
         request_schema=_request_schema(operation, parameters, document, source_type, warnings),
         response_schema=_response_schema(operation, document, source_type, warnings),
+        tags=operation_tags(operation),
     )
+
+
+# A tag is a section name; anything longer is not one worth showing whole.
+_TAG_MAX_LENGTH = 100
+
+
+def operation_tags(operation: Any) -> list[str]:
+    """An operation's tags: non-empty strings, trimmed, each once, in order."""
+    raw = operation.get("tags") if isinstance(operation, dict) else None
+    if not isinstance(raw, list):
+        return []
+    tags: list[str] = []
+    for tag in raw:
+        if isinstance(tag, str) and tag.strip() and tag.strip()[:_TAG_MAX_LENGTH] not in tags:
+            tags.append(tag.strip()[:_TAG_MAX_LENGTH])
+    return tags
 
 
 def _merge_parameters(shared: list[Any], own: Any) -> list[dict[str, Any]]:
