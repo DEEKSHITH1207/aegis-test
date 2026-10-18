@@ -145,7 +145,37 @@ docker compose -f docker-compose.prod.yml up -d --build
   `EXECUTOR_ALLOWED_HOSTS` to your staging and test hosts.
 - **Admin.** `/admin/` is not exposed; only `/api/` reaches Django.
 
-To update: `git pull`, then the same `up -d --build`.
+To update by hand: `git pull`, then the same `up -d --build`.
+
+### Deploying automatically
+
+A systemd timer on the server checks `main` every five minutes and, when it
+has moved, fast-forwards the checkout and runs the same `up -d --build`
+(`deploy/autodeploy.sh`). The server pulls; nothing pushes to it, so SSH can
+stay closed to everyone but you and GitHub holds no key to the server. It
+fetches with the repository's read-only deploy key.
+
+```bash
+# On the server, with the repository cloned to /home/ubuntu/aegis-test
+sudo cp deploy/aegis-autodeploy.service deploy/aegis-autodeploy.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now aegis-autodeploy.timer
+
+systemctl list-timers aegis-autodeploy.timer   # when it next runs
+journalctl -u aegis-autodeploy -f              # what each run did
+sudo systemctl start aegis-autodeploy          # check right now
+```
+
+- **What gets deployed.** Whatever reaches `main`. The timer does not wait
+  for CI, so protect `main` on GitHub (require the CI checks to pass before
+  merging) and only tested code arrives.
+- **Another branch.** `sudo systemctl edit aegis-autodeploy.service`, then add
+  `[Service]` and `Environment=AUTODEPLOY_BRANCH=the-branch`.
+- **When it refuses.** A checkout that cannot fast-forward (a commit made on
+  the server, a force push to `main`) is left untouched and the run fails in
+  the journal; sort out the checkout by hand.
+- **A forced rebuild** without a new commit: `deploy/autodeploy.sh --force`.
+- **Pausing.** `sudo systemctl stop aegis-autodeploy.timer`; `start` resumes.
 
 ## Dashboard
 
