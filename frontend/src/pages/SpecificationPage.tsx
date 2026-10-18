@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { api } from "../api";
+import ConfirmTargetDialog from "../components/ConfirmTargetDialog";
 import EndpointPicker from "../components/EndpointPicker";
 import { ErrorAlert, Loading, Method, Spinner, StatusBadge, formatDate, scopeText } from "../components/ui";
 import { describe, useLoad } from "../hooks";
@@ -161,6 +162,7 @@ function NewRunForm({
   const [headers, setHeaders] = useState<HeaderRow[]>([{ name: "Authorization", value: "" }]);
   const [step, setStep] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   useEffect(() => setBaseUrl((current) => current || suggestedBaseUrl), [suggestedBaseUrl]);
 
@@ -168,13 +170,18 @@ function NewRunForm({
     setHeaders((rows) => rows.map((row, i) => (i === index ? { ...row, ...change } : row)));
   }
 
-  async function onSubmit(event: FormEvent) {
+  function onSubmit(event: FormEvent) {
     event.preventDefault();
     setError(null);
     if (scope === "some" && selected.size === 0) {
       setError("Choose at least one section or endpoint to test.");
       return;
     }
+    setConfirming(true);
+  }
+
+  async function startRun() {
+    setConfirming(false);
     const sent: Record<string, string> = {};
     for (const row of headers) {
       if (row.name.trim() && row.value) sent[row.name.trim()] = row.value;
@@ -313,6 +320,15 @@ function NewRunForm({
         </button>
         {disabled && <p className="hint muted">This API has no endpoints to test.</p>}
       </div>
+      {confirming && (
+        <ConfirmTargetDialog
+          baseUrl={baseUrl.trim()}
+          endpointCount={scope === "some" ? selected.size : endpoints.length}
+          cleanup={cleanup}
+          onConfirm={startRun}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
     </form>
   );
 }
