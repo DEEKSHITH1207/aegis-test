@@ -275,6 +275,69 @@ A run's `status`, `status_detail`, `started_at` and `completed_at` are owned by
 the system and ignored if a client sends them. Test cases and evidence rows are
 written by the generator and the executor, so they are read-only over HTTP.
 
+## Where the specification comes from
+
+The specification is the API's OpenAPI or Swagger document — one JSON or YAML
+file listing every endpoint, the fields it accepts with their types and limits,
+and the responses it can return. The Swagger UI page is that file rendered.
+Most frameworks generate it from code rather than having it written by hand:
+
+| Framework | How to get the document |
+| --- | --- |
+| FastAPI | built in: `GET /openapi.json` |
+| Django REST Framework | add `drf-spectacular`: `GET /api/schema/` |
+| Flask | add `flask-smorest`, `apispec` or `flasgger` |
+| NestJS | `@nestjs/swagger`: `GET /<path>-json`, e.g. `/api-json` after `SwaggerModule.setup('api', ...)` |
+
+The rules come from the request models — Pydantic models, serializers, DTOs —
+not from comments. This model:
+
+```python
+class FinancialYearIn(BaseModel):
+    """Create a financial year."""
+    startYear: int = Field(ge=2000, le=2100)
+```
+
+becomes:
+
+```json
+"FinancialYearIn": {
+  "description": "Create a financial year.",
+  "required": ["startYear"],
+  "properties": {"startYear": {"type": "integer", "minimum": 2000, "maximum": 2100}}
+}
+```
+
+The docstring is only a `description`, which AegisTest does not read. Test
+cases are built from `type`, `required`, `minimum`/`maximum`,
+`minLength`/`maxLength`, `format`, `enum` and the documented response codes.
+In NestJS, `class-validator` decorators (`@IsInt()`, `@Min(2000)`) enforce a
+rule at runtime but reach the document only through `@ApiProperty({minimum:
+2000})` or the `@nestjs/swagger` CLI plugin.
+
+How much is tested depends on how much the document says:
+
+| | Endpoints only | Full schemas |
+| --- | --- | --- |
+| 5xx reported as a crash | yes | yes |
+| Duplicate create, read back, cleanup | only for a POST documenting 201 | yes |
+| Required, type and boundary cases | no | yes |
+| Semantic cases (end before start, negative price, ...) | no | yes |
+| Status codes judged against the document | only crashes, when no responses are listed | yes |
+
+A document without field details still runs, but finds little. Rules a schema
+cannot express — a value computed from other fields, a cross-field rule
+enforced in a validator — belong in a [business-rules file](#business-rules).
+
+With FastAPI in particular:
+
+- give create endpoints `status_code=201`; FastAPI documents 200 by default,
+  and duplicate-create and read-back cases are generated only for a 201;
+- invalid input is answered with 422, which FastAPI documents, so invalid cases
+  expect 422 (see [Expected status codes](#expected-status-codes));
+- a `@model_validator` rule such as "end after start" is not in the document.
+  The semantic cases still probe it when the field names look like a range.
+
 ## Importing a specification
 
 Registering a specification stores the document; it does not read it. Import is
