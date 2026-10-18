@@ -4,11 +4,20 @@ import { describe, expect, it, vi } from "vitest";
 
 import ConfirmTargetDialog, { classifyHost } from "./ConfirmTargetDialog";
 
+const notProduction = () => screen.getByRole("checkbox", { name: /not production/ });
+
 function renderDialog(baseUrl: string) {
   const onConfirm = vi.fn();
   const onCancel = vi.fn();
   render(
-    <ConfirmTargetDialog baseUrl={baseUrl} endpointCount={3} cleanup onConfirm={onConfirm} onCancel={onCancel} />,
+    <ConfirmTargetDialog
+      baseUrl={baseUrl}
+      endpointCount={3}
+      sample={{ method: "GET", path: "/status-report/units" }}
+      cleanup
+      onConfirm={onConfirm}
+      onCancel={onCancel}
+    />,
   );
   return { onConfirm, onCancel };
 }
@@ -32,14 +41,24 @@ describe("classifyHost", () => {
 });
 
 describe("ConfirmTargetDialog", () => {
-  it("starts a run on a staging host after one click", async () => {
+  it("asks even for a staging host, since the label is only a guess", async () => {
     const { onConfirm } = renderDialog("https://api.staging.example.com/api");
+    const start = screen.getByRole("button", { name: "Start run" });
 
     expect(screen.getByText("api.staging.example.com")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Start run" }));
+    expect(screen.queryByLabelText(/to confirm/)).not.toBeInTheDocument();
+    expect(start).toBeDisabled();
+    await userEvent.click(notProduction());
+    await userEvent.click(start);
 
     expect(onConfirm).toHaveBeenCalledOnce();
+  });
+
+  it("shows a full request URL so a missing path prefix is visible", () => {
+    renderDialog("https://api.staging.example.com/api/");
+
+    expect(screen.getByText("GET https://api.staging.example.com/api/status-report/units")).toBeInTheDocument();
   });
 
   it("makes the user type an unrecognised host before it can start", async () => {
@@ -47,6 +66,7 @@ describe("ConfirmTargetDialog", () => {
     const start = screen.getByRole("button", { name: "Start run" });
 
     expect(screen.getByRole("alert")).toHaveTextContent("Never run AegisTest against production");
+    await userEvent.click(notProduction());
     expect(start).toBeDisabled();
     await userEvent.type(screen.getByLabelText(/to confirm/), "api.example");
     expect(start).toBeDisabled();

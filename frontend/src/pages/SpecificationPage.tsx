@@ -324,6 +324,7 @@ function NewRunForm({
         <ConfirmTargetDialog
           baseUrl={baseUrl.trim()}
           endpointCount={scope === "some" ? selected.size : endpoints.length}
+          sample={sampleEndpoint(scope === "some" ? endpoints.filter((e) => selected.has(e.id)) : endpoints)}
           cleanup={cleanup}
           onConfirm={startRun}
           onCancel={() => setConfirming(false)}
@@ -331,4 +332,9 @@ function NewRunForm({
       )}
     </form>
   );
+}
+
+/** A GET without path parameters if there is one: its URL is the plainest to check. */
+function sampleEndpoint(endpoints: Endpoint[]): Endpoint | undefined {
+  return endpoints.find((e) => e.method === "GET" && !e.path.includes("{")) ?? endpoints[0];
 }

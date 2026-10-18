@@ -42,15 +42,23 @@ const LABELS: Record<HostKind, string> = {
   other: "Not recognised as local or staging",
 };
 
+/** How the executor builds a request URL: the base URL, then the path. */
+export function requestUrl(baseUrl: string, path: string): string {
+  return baseUrl.replace(/\/+$/, "") + path;
+}
+
 export default function ConfirmTargetDialog({
   baseUrl,
   endpointCount,
+  sample,
   cleanup,
   onConfirm,
   onCancel,
 }: {
   baseUrl: string;
   endpointCount: number;
+  /** One endpoint the run will call, to show a full request URL. */
+  sample?: { method: string; path: string };
   cleanup: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -58,8 +66,12 @@ export default function ConfirmTargetDialog({
   const host = hostOf(baseUrl);
   const kind = classifyHost(host);
   const [typed, setTyped] = useState("");
-  const firstFocus = useRef<HTMLInputElement & HTMLButtonElement>(null);
-  const confirmed = kind !== "other" || typed.trim().toLowerCase() === host.toLowerCase();
+  const [notProduction, setNotProduction] = useState(false);
+  const firstFocus = useRef<HTMLInputElement>(null);
+  // The label is only a guess from the name, so every host needs the tick;
+  // one the guess does not recognise also has to be typed out.
+  const confirmed =
+    notProduction && (kind !== "other" || typed.trim().toLowerCase() === host.toLowerCase());
 
   useEffect(() => firstFocus.current?.focus(), []);
   useEffect(() => {
@@ -82,6 +94,14 @@ export default function ConfirmTargetDialog({
           <code>{host}</code>
           <span className={`host-kind host-kind-${kind}`}>{LABELS[kind]}</span>
         </p>
+        {sample && (
+          <div className="modal-request">
+            <span className="hint">A request will look like this. Check the path prefix is right:</span>
+            <code>
+              {sample.method} {requestUrl(baseUrl, sample.path)}
+            </code>
+          </div>
+        )}
         <ul className="modal-facts">
           <li>
             Sends generated tests to {endpointCount} endpoint{endpointCount === 1 ? "" : "s"}, including invalid
@@ -96,30 +116,43 @@ export default function ConfirmTargetDialog({
         </ul>
 
         {kind === "other" && (
-          <>
-            <div className="alert warning" role="alert">
-              This does not look like a local or staging address. Never run AegisTest against production: it
-              writes test data and sends invalid requests.
-            </div>
-            <div className="field">
-              <label htmlFor="confirm-host">
-                Type <code>{host}</code> to confirm
-              </label>
-              <input
-                id="confirm-host"
-                type="text"
-                autoComplete="off"
-                spellCheck={false}
-                ref={firstFocus}
-                value={typed}
-                onChange={(e) => setTyped(e.target.value)}
-              />
-            </div>
-          </>
+          <div className="alert warning" role="alert">
+            This does not look like a local or staging address. Never run AegisTest against production: it writes
+            test data and sends invalid requests.
+          </div>
+        )}
+
+        <label className="choice">
+          <input
+            type="checkbox"
+            ref={firstFocus}
+            checked={notProduction}
+            onChange={(e) => setNotProduction(e.target.checked)}
+          />
+          <span>
+            This is a local or staging environment, not production
+            <span className="hint">The label above is a guess from the host name; only you know.</span>
+          </span>
+        </label>
+
+        {kind === "other" && (
+          <div className="field">
+            <label htmlFor="confirm-host">
+              Type <code>{host}</code> to confirm
+            </label>
+            <input
+              id="confirm-host"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+            />
+          </div>
         )}
 
         <div className="modal-actions">
-          <button type="button" className="btn" onClick={onCancel} ref={kind === "other" ? undefined : firstFocus}>
+          <button type="button" className="btn" onClick={onCancel}>
             Cancel
           </button>
           <button type="button" className="btn btn-primary" disabled={!confirmed} onClick={onConfirm}>

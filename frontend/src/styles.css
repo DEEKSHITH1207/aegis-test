@@ -790,3 +790,19 @@ select:focus-visible,
   gap: 8px;
   margin-top: 4px;
 }
+.modal-request {
+  display: grid;
+  gap: 4px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+.modal-request code {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.modal .choice {
+  margin-bottom: 12px;
+}
